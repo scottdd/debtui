@@ -13,7 +13,7 @@ A terminal user interface (TUI) front-end for [deb-get](https://github.com/wimpy
 
 ## Background
 
-I am learning Odin, and plan to build a fleet of TUI apps. I chose this as my first project because deb-get could do the hard work and I could learn some of the tricks of the Odin trade. This tool scratches an itch I had using deb-get, and I hope it helps you, too.
+This application is clanker code. I am learning Odin, and plan to build a fleet of TUI apps. I chose this as my first project because deb-get could do the hard work and I could learn some of the tricks of the Odin trade. This tool scratches an itch I had using deb-get, and I hope it helps you, too. 
 
 ## Prerequisites
 
