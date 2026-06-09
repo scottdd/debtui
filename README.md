@@ -9,7 +9,7 @@ A terminal user interface (TUI) front-end for [deb-get](https://github.com/wimpy
 - Mark packages directly for installation (`i`) or uninstallation (`u`) from the main list
 - Apply all marked operations at once with `Enter`
 - Reset all marks with `r`
-- Real-time throbber in the status bar while operations are running
+- 'Recent Actions' pane shows success or failure for each recent install/uninstall action
 
 ## Background
 
