@@ -63,16 +63,22 @@ App :: struct {
     last_error:   string,      // shown in status for a while
     last_message: string,      // success messages etc.
 
-    // For processing feedback
-    processing:   bool,
-    spinner_frame: int,
-    process_output: string,
+    // For processing feedback (throbber removed; using status pane instead)
+    // processing:   bool,
+    // spinner_frame: int,
+    // process_output: string,
+
+    // Recent Operations status pane (bottom 75% of right column)
+    status_lines:  [dynamic]string,
+    status_scroll: int,
 }
 
 // --------------------------- List helpers ------------------------------------
 
-// Ensure selection and scroll are within valid range for a list of given length
-clamp_list_state :: proc(selection, scroll: ^int, list_len: int, viewport_height: int) {
+// Center the selection in the viewport until we hit the top or bottom of the list.
+// The selection "bar" stays near the middle; the list scrolls under it.
+// Only near the very top or very bottom does the highlighted row move away from center.
+recenter_list :: proc(selection, scroll: ^int, list_len: int, viewport_height: int) {
     if list_len == 0 {
         selection^ = 0
         scroll^ = 0
@@ -82,21 +88,21 @@ clamp_list_state :: proc(selection, scroll: ^int, list_len: int, viewport_height
     if selection^ < 0 do selection^ = 0
     if selection^ >= list_len do selection^ = list_len - 1
 
-    // Keep selection visible
-    if selection^ < scroll^ {
-        scroll^ = selection^
-    }
-    if selection^ >= scroll^ + viewport_height {
-        scroll^ = selection^ - viewport_height + 1
-    }
-    if scroll^ < 0 do scroll^ = 0
+    preferred := viewport_height / 2
+    ideal_scroll := selection^ - preferred
+    max_scroll := max(0, list_len - viewport_height)
+
+    if ideal_scroll < 0 { ideal_scroll = 0 }
+    if ideal_scroll > max_scroll { ideal_scroll = max_scroll }
+
+    scroll^ = ideal_scroll
 }
 
 // Move selection by delta (up/down)
 move_selection :: proc(selection, scroll: ^int, list_len: int, delta: int, viewport_height: int) {
     if list_len == 0 do return
     selection^ += delta
-    clamp_list_state(selection, scroll, list_len, viewport_height)
+    recenter_list(selection, scroll, list_len, viewport_height)
 }
 
 // Page up / down
@@ -105,7 +111,7 @@ page_move :: proc(selection, scroll: ^int, list_len: int, direction: int, viewpo
     delta := viewport_height - 1
     if direction < 0 do delta = -delta
     selection^ += delta
-    clamp_list_state(selection, scroll, list_len, viewport_height)
+    recenter_list(selection, scroll, list_len, viewport_height)
 }
 
 // Jump to start or end
@@ -116,7 +122,7 @@ jump_to :: proc(selection, scroll: ^int, list_len: int, to_end: bool, viewport_h
     } else {
         selection^ = 0
     }
-    clamp_list_state(selection, scroll, list_len, viewport_height)
+    recenter_list(selection, scroll, list_len, viewport_height)
 }
 
 // --------------------------- Drawing -----------------------------------------
@@ -346,7 +352,7 @@ draw :: proc(app: ^App) {
 
     // LEFT: Available (now uses nearly full height)
     left_viewport := h - 5   // leave room for header + status bar
-    clamp_list_state(&app.left_selection, &app.left_scroll, len(app.available), left_viewport)
+    recenter_list(&app.left_selection, &app.left_scroll, len(app.available), left_viewport)
 
     for i in 0..<left_viewport {
         idx := app.left_scroll + i
@@ -375,12 +381,18 @@ draw :: proc(app: ^App) {
         draw_list_item(left_x, y, left_width, pkg, is_sel, is_inst, is_pend, is_pend_rm)
     }
 
-    // ---------------- RIGHT: Details (full height) ----------------
-    detail_y := details_start_y
-    detail_h := h - 1 - detail_y   // leave room for status bar
-    if detail_h < 3 do detail_h = 3
+    // ---------------- RIGHT: Split into Package details (top ~25%) + Recent Operations (bottom ~75%) ----------------
+    right_content_top := details_start_y
+    right_content_h := h - 1 - right_content_top   // above the global bottom status bar
+    if right_content_h < 6 do right_content_h = 6
 
-    // Blank the entire details pane before drawing new content (prevents ghosting)
+    details_portion_h := max(4, right_content_h * 25 / 100)
+    status_portion_h := right_content_h - details_portion_h
+
+    detail_y := right_content_top
+    detail_h := details_portion_h
+
+    // Blank the details portion
     for i in 0..<detail_h {
         move_cursor(right_x, detail_y + i)
         set_bg(DETAIL_BG)
@@ -390,7 +402,7 @@ draw :: proc(app: ^App) {
         reset_attrs()
     }
 
-    // Show details for current left selection
+    // Show details for current left selection (top portion)
     if (len(app.available) > 0) && (app.left_selection < len(app.available)) {
         sel_pkg := app.available[app.left_selection]
 
@@ -582,6 +594,109 @@ draw :: proc(app: ^App) {
         reset_attrs()
     }
 
+    // ---------------- Recent Operations (bottom ~75% of right column) ----------------
+    status_region_y := detail_y + detail_h
+    if status_portion_h > 0 {
+        // Blank the status portion (including space for its header)
+        for i in 0..<status_portion_h {
+            move_cursor(right_x, status_region_y + i)
+            set_bg(DETAIL_BG)   // reuse dark bg for consistency
+            set_fg(DETAIL_FG)
+            spaces := strings.repeat(" ", right_width)
+            write(spaces)
+            reset_attrs()
+        }
+
+        // Header for the status pane
+        move_cursor(right_x, status_region_y)
+        set_bg(DETAIL_BG)
+        set_fg(COLOR_HEADER)
+        header := "Recent Operations"
+        write(header)
+        if len(header) < right_width {
+            pad := right_width - len(header)
+            write(strings.repeat(" ", pad))
+        }
+        reset_attrs()
+
+        // Draw the status lines with auto-scroll viewport
+        status_view_h := status_portion_h - 1   // leave room for header
+        if status_view_h < 1 do status_view_h = 1
+
+        // Make sure scroll is reasonable
+        max_scroll := max(0, len(app.status_lines) - status_view_h)
+        if app.status_scroll > max_scroll do app.status_scroll = max_scroll
+        if app.status_scroll < 0 do app.status_scroll = 0
+
+        for i in 0..<status_view_h {
+            idx := app.status_scroll + i
+            y := status_region_y + 1 + i
+            if y >= h - 1 do break
+            if idx >= len(app.status_lines) {
+                // blank remaining
+                move_cursor(right_x, y)
+                set_bg(DETAIL_BG)
+                set_fg(DETAIL_FG)
+                write(strings.repeat(" ", right_width))
+                reset_attrs()
+                continue
+            }
+
+            line := app.status_lines[idx]
+
+            move_cursor(right_x, y)
+            set_bg(DETAIL_BG)
+
+            // Color logic:
+            // success (installed/removed) -> green action + white pkg
+            // failure -> red action + white pkg
+            // package name always the normal white used in left list
+            is_success := strings.has_prefix(line, "installed:") || strings.has_prefix(line, "removed:")
+            action_color := Color.BrightGreen
+            if !is_success {
+                action_color = Color.BrightRed
+            }
+
+            // Find split point for coloring
+            colon_idx := strings.index(line, ": ")
+            if colon_idx >= 0 {
+                action_part := line[:colon_idx+2]
+                pkg_part := line[colon_idx+2:]
+
+                // Truncate if needed to fit width
+                total_needed := len(action_part) + len(pkg_part)
+                if total_needed > right_width {
+                    max_pkg := right_width - len(action_part) - 1
+                    if max_pkg < 1 { max_pkg = 1 }
+                    pkg_part = strings.concatenate({pkg_part[:max_pkg], "…"})
+                }
+
+                set_fg(action_color)
+                write(action_part)
+                set_fg(COLOR_NORMAL)   // same white as left list names
+                write(pkg_part)
+
+                // pad
+                written := len(action_part) + len(pkg_part)
+                if written < right_width {
+                    write(strings.repeat(" ", right_width - written))
+                }
+            } else {
+                // fallback
+                set_fg(COLOR_NORMAL)
+                txt := line
+                if len(txt) > right_width {
+                    txt = strings.concatenate({txt[:right_width-1], "…"})
+                }
+                write(txt)
+                if len(txt) < right_width {
+                    write(strings.repeat(" ", right_width - len(txt)))
+                }
+            }
+            reset_attrs()
+        }
+    }
+
     // ---------------- Status bar ----------------
     status_y := h - 1
     move_cursor(1, status_y)
@@ -612,25 +727,18 @@ draw :: proc(app: ^App) {
     }
 
     // Key hints (context sensitive a bit)
-    if app.processing {
-        ch := spinner_frames[app.spinner_frame % len(spinner_frames)]
-        set_fg(Color.BrightYellow)
-        writef(" %s Processing packages...", ch)
-        set_fg(COLOR_STATUS_FG)
-    } else {
-        write("↑↓/jk: move  i: mark install  u: mark uninstall  Enter: apply  r: reset  R: refresh  q: quit")
+    write("↑↓/jk: move  i: mark install  u: mark uninstall  Enter: apply  r: reset  R: refresh  q: quit")
 
-        if app.last_error != "" {
-            set_fg(Color.BrightRed)
-            write("   ERROR: ")
-            write(app.last_error)
-            set_fg(COLOR_STATUS_FG)
-        } else if app.last_message != "" {
-            set_fg(Color.BrightGreen)
-            write("   ")
-            write(app.last_message)
-            set_fg(COLOR_STATUS_FG)
-        }
+    if app.last_error != "" {
+        set_fg(Color.BrightRed)
+        write("   ERROR: ")
+        write(app.last_error)
+        set_fg(COLOR_STATUS_FG)
+    } else if app.last_message != "" {
+        set_fg(Color.BrightGreen)
+        write("   ")
+        write(app.last_message)
+        set_fg(COLOR_STATUS_FG)
     }
 
     reset_attrs()
@@ -646,6 +754,7 @@ init_app :: proc() -> App {
         installed_set     = make(map[string]bool),
         pending_install   = make(map[string]bool),
         pending_remove    = make(map[string]bool),
+        status_lines      = make([dynamic]string),
     }
     return app
 }
@@ -655,6 +764,7 @@ destroy_app :: proc(app: ^App) {
     delete(app.installed_set)
     delete(app.pending_install)
     delete(app.pending_remove)
+    delete(app.status_lines)
     if app.available != nil do delete(app.available)
     if app.installed != nil do delete(app.installed)
 }
@@ -689,8 +799,8 @@ refresh_data :: proc(app: ^App) -> bool {
     cleanup_persistent_cache(avail)
     log_cache_error("refresh_data: persistent cache cleanup returned successfully")
 
-    // Clamp selections
-    clamp_list_state(&app.left_selection, &app.left_scroll, len(app.available), 20)
+    // Recenter selection (new middle-locked scrolling)
+    recenter_list(&app.left_selection, &app.left_scroll, len(app.available), 20)
 
     // Invalidate current details (will be refetched on draw if needed)
     app.needs_redraw = true
@@ -761,6 +871,7 @@ reset_marks :: proc(app: ^App) {
 
 // Process all pending operations
 apply_pending :: proc(app: ^App) {
+    // Collect lists (copy because we clear as we go)
     to_install := make([dynamic]string, 0, len(app.pending_install))
     for p in app.pending_install {
         append(&to_install, p)
@@ -777,54 +888,74 @@ apply_pending :: proc(app: ^App) {
         return
     }
 
-    app.processing = true
-    app.spinner_frame = 0
-    app.needs_redraw = true
-    draw(app)  // show initial processing state with throbber
+    // Clear previous operation results and start fresh (per user spec)
+    clear_status_lines(app)
 
+    // Process one package at a time so we can report per-app status in the pane.
+    // Installs first, then removes.
 
-    // We will do install first, then remove.
-    // After each, we refresh the installed list.
-
-    success := true
-    output: strings.Builder
-    strings.builder_init(&output)
-    defer strings.builder_destroy(&output)
-
-    if len(to_install) > 0 {
-        ok, out := perform_install(to_install[:])
-        strings.write_string(&output, "=== INSTALL ===\n")
-        strings.write_string(&output, out)
-        strings.write_string(&output, "\n")
-        if !ok do success = false
+    for p in to_install {
+        ok, _ := perform_install([]string{p})
+        if ok {
+            append_status_line(app, fmt.tprintf("installed: %s", p))
+        } else {
+            append_status_line(app, fmt.tprintf("failed to install: %s", p))
+        }
+        app.needs_redraw = true
+        draw(app)  // live update in status pane
     }
 
-    if len(to_remove) > 0 {
-        ok, out := perform_remove(to_remove[:])
-        strings.write_string(&output, "=== REMOVE ===\n")
-        strings.write_string(&output, out)
-        strings.write_string(&output, "\n")
-        if !ok do success = false
+    for p in to_remove {
+        ok, _ := perform_remove([]string{p})
+        if ok {
+            append_status_line(app, fmt.tprintf("removed: %s", p))
+        } else {
+            append_status_line(app, fmt.tprintf("failed to remove: %s", p))
+        }
+        app.needs_redraw = true
+        draw(app)
     }
 
-    // Refresh data so UI reflects reality
+    // Final refresh so left list and installed markers update
     refresh_data(app)
 
-    // Clear marks only if we had some success (or always? usually always)
     clear(&app.pending_install)
     clear(&app.pending_remove)
 
-    app.processing = false
-    app.process_output = strings.to_string(output)
-
-    if success {
-        app.last_message = "Operations completed. Press any key to continue..."
-    } else {
-        app.last_error = "Some operations failed. Press any key..."
-    }
-
     app.needs_redraw = true
 }
+
+// --------------------------- Status pane helpers (Recent Operations) -----------
+
+append_status_line :: proc(app: ^App, line: string) {
+    append(&app.status_lines, line)
+
+    // Auto-scroll if we were at or near the bottom
+    viewport := max(1, get_status_viewport_height())
+    if len(app.status_lines) > viewport {
+        // if previously at bottom, keep at bottom
+        if app.status_scroll >= len(app.status_lines) - viewport - 1 {
+            app.status_scroll = len(app.status_lines) - viewport
+        }
+    } else {
+        app.status_scroll = 0
+    }
+}
+
+clear_status_lines :: proc(app: ^App) {
+    clear(&app.status_lines)
+    app.status_scroll = 0
+}
+
+get_status_viewport_height :: proc() -> int {
+    h := term_height
+    right_content_h := h - 1 - 3   // rough, above global status bar, below header area
+    if right_content_h < 4 do right_content_h = 4
+    details_portion := max(4, right_content_h * 25 / 100)
+    return right_content_h - details_portion - 1  // -1 for the "Recent Operations" header
+}
+
+// -----------------------------------------------------------------------------
 
 // Ask the user whether to apply all pending changes before quitting (all-or-nothing).
 // Message format: 'apply pending changes (y/N ##s)? '
@@ -918,6 +1049,7 @@ handle_key :: proc(app: ^App, key: Key) -> bool {
             app.needs_redraw = true
 
         case .Enter:
+            clear_status_lines(app)
             apply_pending(app)
 
         case .PageUp, .PageDown:
@@ -971,6 +1103,7 @@ handle_key :: proc(app: ^App, key: Key) -> bool {
 
         case 'R':
             refresh_data(app)
+            clear_status_lines(app)
             app.last_message = "Refreshed from deb-get"
 
         case 'j', 'J':
@@ -1007,46 +1140,9 @@ handle_key :: proc(app: ^App, key: Key) -> bool {
 }
 
 // After apply_pending we show the command output in a simple "press any key" screen
+// (kept for now but no longer triggered; output now lives in the Recent Operations pane)
 show_process_result :: proc(app: ^App) {
-    clear_screen()
-    move_cursor(2, 2)
-    set_fg(Color.BrightWhite)
-    write("Operation results")
-    reset_attrs()
-
-    move_cursor(2, 4)
-
-    if app.process_output == "" {
-        write("(no output)")
-    } else {
-        lines := strings.split_lines(app.process_output)
-        max_lines := term_height - 6
-        for &ln, i in lines {
-            if i >= max_lines do break
-            move_cursor(2, 4 + i)
-            // crude wrapping
-            if len(ln) > term_width - 4 {
-                ln = strings.concatenate({ln[:term_width-5], "…"})
-            }
-            write(ln)
-        }
-    }
-
-    move_cursor(2, term_height - 2)
-    set_fg(Color.BrightYellow)
-    write("Press any key to return to the package browser...")
-    reset_attrs()
-
-    // Wait for any key
-    for {
-        k := read_key()
-        if _, is_timeout := k.(Timeout); !is_timeout {
-            break
-        }
-        sleep_ms(10)
-    }
-
-    app.process_output = ""
+    // The new status pane in the right column replaces this full-screen result view.
     app.last_message = ""
     app.last_error = ""
     app.needs_redraw = true
@@ -1109,10 +1205,6 @@ main :: proc() {
 
         // Timeout means no key was available this tick (our VTIME in raw mode)
         if _, is_timeout := key.(Timeout); is_timeout {
-            if app.processing {
-                app.spinner_frame += 1
-                app.needs_redraw = true
-            }
             if app.needs_redraw {
                 draw(&app)
                 app.needs_redraw = false
@@ -1127,12 +1219,6 @@ main :: proc() {
         if app.needs_redraw {
             draw(&app)
             app.needs_redraw = false
-        }
-
-        // If we just finished processing, show the result screen
-        if app.process_output != "" {
-            show_process_result(&app)
-            draw(&app)
         }
 
         if !still_running {
