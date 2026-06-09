@@ -24,6 +24,10 @@ verbose := false
 //   +---------------------------+--------------------------------+
 //   | LEFT: Available packages  | RIGHT: Package details         |
 //   | (scrollable list)         | (for currently selected item)  |
+//   |                           |                                |
+//   |                           | Recent Operations              |
+//   |                           | (list install/uninstall status |
+//   |                           | info from most recent APPLY)   |
 //   +---------------------------+--------------------------------+
 //   | Status bar: pending marks + throbber during operations     |
 //   +------------------------------------------------------------+
