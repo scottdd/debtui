@@ -7,8 +7,13 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:time"
+import "core:mem"
+import "core:slice"
 
-DEBTUI_VERSION :: "0.1.0"
+// Set while the RO panel is collecting a sudo password (status bar hint changes).
+password_entry_active := false
+
+DEBTUI_VERSION :: "0.2.0"
 
 // Global verbose flag controlled by --verbose / -v.
 // When false, we suppress the detailed diagnostic logging that was added
@@ -17,25 +22,31 @@ DEBTUI_VERSION :: "0.1.0"
 // operational messages are still always logged.
 verbose := false
 
+// Scratch arena for one draw frame (padding strings, wrap lines, etc.).
+// Avoids leaking heap allocations on every redraw.
+draw_frame_backing: []byte
+draw_frame_arena: mem.Arena
+
 // ============================================================================
 // debtui - TUI frontend for deb-get
 //
 // Layout (two panes):
 //   +---------------------------+--------------------------------+
 //   | LEFT: Available packages  | RIGHT: Package details         |
-//   | (scrollable list)         | (for currently selected item)  |
-//   |                           |                                |
-//   |                           | Recent Operations              |
-//   |                           | (list install/uninstall status |
-//   |                           | info from most recent APPLY)   |
+//   | (scrollable list)         | (upper half)                   |
+//   |                           | Recent Operations (mid-screen) |
+//   |                           | operation log (below)          |
 //   +---------------------------+--------------------------------+
-//   | Status bar: pending marks + throbber during operations     |
+//   | Status bar: key hints                                      |
 //   +------------------------------------------------------------+
 //
 // All marking and navigation happens in the single left list.
-// `i` = mark for install, `u` = mark for uninstall (on installed items).
-// Details always reflect the left list selection.
+// Space = toggle mark (install if free, remove if installed).
+// Details always reflect the left list selection (or Help when show_help).
 // ============================================================================
+
+// Minimum seconds between user-initiated list fetches (f). Startup counts as a fetch.
+FETCH_COOLDOWN_SECONDS :: 30
 
 // --------------------------- App State ---------------------------------------
 
@@ -64,15 +75,14 @@ App :: struct {
     // UI / terminal
     needs_redraw: bool,
     running:      bool,
-    last_error:   string,      // shown in status for a while
-    last_message: string,      // success messages etc.
+    last_error:   string,      // for exit summary / rare failures (not status bar)
+    show_help:    bool,        // right pane shows help instead of package details
 
-    // For processing feedback (throbber removed; using status pane instead)
-    // processing:   bool,
-    // spinner_frame: int,
-    // process_output: string,
+    // Rate limit for f (Fetch list)
+    last_fetch_unix: i64,
 
-    // Recent Operations status pane (bottom 75% of right column)
+    // Recent Operations log (right column, below fixed mid-screen header)
+    // Holds pending marks while staging, then apply results after Enter.
     status_lines:  [dynamic]string,
     status_scroll: int,
 }
@@ -155,9 +165,6 @@ BASE_FG :: Color.White
 // Details pane specific
 DETAIL_BG :: BgColor.Black
 DETAIL_FG :: Color.BrightWhite   // bright grey / light text on black for detail lines
-
-// ASCII spinner frames for processing feedback
-spinner_frames := [?]string{"|", "/", "-", "\\"}
 
 // Draw a single list item with optional markers.
 // Always writes exactly `width` characters so the pane looks solid.
@@ -279,6 +286,50 @@ wrap_text :: proc(text: string, max_width: int) -> []string {
     return lines[:]
 }
 
+ensure_draw_frame_arena :: proc() {
+    if draw_frame_backing == nil {
+        draw_frame_backing = make([]byte, 1 * 1024 * 1024) // 1 MiB per frame
+    }
+}
+
+// Fixed screen Y for the "Recent Operations" header: about halfway down the
+// terminal, independent of list selection. Clamped so details + log still fit.
+recent_ops_header_y :: proc(term_h, list_start_y: int) -> int {
+    y := term_h / 2
+    // Keep at least one detail row above when possible
+    if y < list_start_y {
+        y = list_start_y
+    }
+    // Leave room for at least one log row and the bottom status bar
+    if y > term_h - 3 {
+        y = max(list_start_y, term_h - 3)
+    }
+    return y
+}
+
+// Ensure package details for the current selection use the permanent allocator
+// (must run before switching context.allocator to the draw-frame arena).
+ensure_selection_details :: proc(app: ^App) {
+    if len(app.available) == 0 || app.left_selection >= len(app.available) {
+        return
+    }
+    sel_pkg := app.available[app.left_selection]
+    if verbose {
+        log_cache_error(fmt.tprintf("draw: about to ensure details for current selection '%s'", sel_pkg))
+    }
+    if _, ok := app.details_cache[sel_pkg]; ok {
+        return
+    }
+    if details, ok2 := get_package_details(sel_pkg); ok2 {
+        app.details_cache[sel_pkg] = details
+    } else {
+        app.details_cache[sel_pkg] = Package_Details{
+            package_name = sel_pkg,
+            raw = "Failed to fetch details from deb-get",
+        }
+    }
+}
+
 // Main draw routine - called after every significant state change
 draw :: proc(app: ^App) {
     clear_screen()
@@ -295,16 +346,7 @@ draw :: proc(app: ^App) {
         return
     }
 
-    // Establish base colors for the TUI (black background, white text)
-    set_bg(BASE_BG)
-    set_fg(BASE_FG)
-
-    // Make sure we start from a clean attribute state for this frame
-    reset_attrs()
-    set_bg(BASE_BG)
-    set_fg(BASE_FG)
-
-    // Layout calculations - simplified two-pane layout
+    // Layout calculations - two-pane layout
     left_width  := w * 45 / 100
     right_width := w - left_width - 1   // 1 for separator
 
@@ -314,8 +356,36 @@ draw :: proc(app: ^App) {
     header_y := 1
     list_start_y := 3
 
-    // Details pane now takes the full remaining height on the right
-    details_start_y := list_start_y
+    // LEFT list viewport: rows from list_start_y through h-2 (status bar at h-1)
+    // list_start_y=3 → height = h-2-3+1 = h-4
+    left_viewport := h - 4
+    recenter_list(&app.left_selection, &app.left_scroll, len(app.available), left_viewport)
+
+    // Recent Operations header is fixed mid-screen (does not follow selection)
+    ro_header_y := recent_ops_header_y(h, list_start_y)
+    detail_y := list_start_y
+    detail_h := max(0, ro_header_y - detail_y)
+    status_region_y := ro_header_y
+    status_portion_h := max(0, (h - 1) - status_region_y) // down to row above bottom status bar
+
+    // Fetch details with permanent allocator before frame-local arena
+    ensure_selection_details(app)
+
+    // Frame arena: all padding / wrap allocations for this draw are freed when
+    // we leave (arena reset next frame via re-init).
+    ensure_draw_frame_arena()
+    mem.arena_init(&draw_frame_arena, draw_frame_backing)
+    prev_alloc := context.allocator
+    context.allocator = mem.arena_allocator(&draw_frame_arena)
+    defer context.allocator = prev_alloc
+
+    // Establish base colors for the TUI (black background, white text)
+    set_bg(BASE_BG)
+    set_fg(BASE_FG)
+
+    reset_attrs()
+    set_bg(BASE_BG)
+    set_fg(BASE_FG)
 
     // ---------------- Header ----------------
     set_fg(COLOR_TITLE)
@@ -341,23 +411,22 @@ draw :: proc(app: ^App) {
     }
     reset_attrs()
 
-    // ---------------- Details header (now full height on right) ----------------
+    // ---------------- Details / Help column header ----------------
     move_cursor(right_x, list_start_y - 1)
     write(strings.repeat(" ", right_width))
     move_cursor(right_x, list_start_y - 1)
     set_fg(COLOR_HEADER)
-    write("Package details")
+    if app.show_help {
+        write("Help")
+    } else {
+        write("Package details")
+    }
     reset_attrs()
 
     // ---------------- Draw vertical separator (full height) ----------------
     draw_vline(left_width + 1, list_start_y - 1, h - 3, '│')
 
-    // ---------------- Draw lists ----------------
-
-    // LEFT: Available (now uses nearly full height)
-    left_viewport := h - 5   // leave room for header + status bar
-    recenter_list(&app.left_selection, &app.left_scroll, len(app.available), left_viewport)
-
+    // ---------------- LEFT: package list ----------------
     for i in 0..<left_viewport {
         idx := app.left_scroll + i
         y := list_start_y + i
@@ -385,16 +454,7 @@ draw :: proc(app: ^App) {
         draw_list_item(left_x, y, left_width, pkg, is_sel, is_inst, is_pend, is_pend_rm)
     }
 
-    // ---------------- RIGHT: Split into Package details (top ~25%) + Recent Operations (bottom ~75%) ----------------
-    right_content_top := details_start_y
-    right_content_h := h - 1 - right_content_top   // above the global bottom status bar
-    if right_content_h < 6 do right_content_h = 6
-
-    details_portion_h := max(4, right_content_h * 25 / 100)
-    status_portion_h := right_content_h - details_portion_h
-
-    detail_y := right_content_top
-    detail_h := details_portion_h
+    // ---------------- RIGHT: details above mid-screen; RO header fixed; log below ----------------
 
     // Blank the details portion
     for i in 0..<detail_h {
@@ -406,26 +466,11 @@ draw :: proc(app: ^App) {
         reset_attrs()
     }
 
-    // Show details for current left selection (top portion)
-    if (len(app.available) > 0) && (app.left_selection < len(app.available)) {
+    // Show help or package details (above Recent Operations)
+    if detail_h > 0 && app.show_help {
+        draw_help_pane(right_x, detail_y, right_width, detail_h)
+    } else if detail_h > 0 && (len(app.available) > 0) && (app.left_selection < len(app.available)) {
         sel_pkg := app.available[app.left_selection]
-
-        if verbose {
-            log_cache_error(fmt.tprintf("draw: about to ensure details for current selection '%s'", sel_pkg))
-        }
-
-        // Ensure we have details
-        if _, ok := app.details_cache[sel_pkg]; !ok {
-            if details, ok2 := get_package_details(sel_pkg); ok2 {
-                app.details_cache[sel_pkg] = details
-            } else {
-                app.details_cache[sel_pkg] = Package_Details{
-                    package_name = sel_pkg,
-                    raw = "Failed to fetch details from deb-get",
-                }
-            }
-        }
-
         det := app.details_cache[sel_pkg]
 
         // Title line (keep cyan as requested) - wrap if extremely long
@@ -591,27 +636,26 @@ draw :: proc(app: ^App) {
             }
             reset_attrs()
         }
-    } else {
+    } else if detail_h > 0 {
         move_cursor(right_x, detail_y)
         set_fg(COLOR_DIM)
         write("(no package selected)")
         reset_attrs()
     }
 
-    // ---------------- Recent Operations (bottom ~75% of right column) ----------------
-    status_region_y := detail_y + detail_h
+    // ---------------- Recent Operations (fixed mid-screen header) ----------------
     if status_portion_h > 0 {
-        // Blank the status portion (including space for its header)
+        // Blank the status portion (header + log)
         for i in 0..<status_portion_h {
             move_cursor(right_x, status_region_y + i)
-            set_bg(DETAIL_BG)   // reuse dark bg for consistency
+            set_bg(DETAIL_BG)
             set_fg(DETAIL_FG)
             spaces := strings.repeat(" ", right_width)
             write(spaces)
             reset_attrs()
         }
 
-        // Header for the status pane
+        // Header stays at fixed mid-screen row
         move_cursor(right_x, status_region_y)
         set_bg(DETAIL_BG)
         set_fg(COLOR_HEADER)
@@ -623,11 +667,10 @@ draw :: proc(app: ^App) {
         }
         reset_attrs()
 
-        // Draw the status lines with auto-scroll viewport
-        status_view_h := status_portion_h - 1   // leave room for header
-        if status_view_h < 1 do status_view_h = 1
+        // Log lines below the header
+        status_view_h := status_portion_h - 1
+        if status_view_h < 1 do status_view_h = 0
 
-        // Make sure scroll is reasonable
         max_scroll := max(0, len(app.status_lines) - status_view_h)
         if app.status_scroll > max_scroll do app.status_scroll = max_scroll
         if app.status_scroll < 0 do app.status_scroll = 0
@@ -637,7 +680,6 @@ draw :: proc(app: ^App) {
             y := status_region_y + 1 + i
             if y >= h - 1 do break
             if idx >= len(app.status_lines) {
-                // blank remaining
                 move_cursor(right_x, y)
                 set_bg(DETAIL_BG)
                 set_fg(DETAIL_FG)
@@ -651,23 +693,28 @@ draw :: proc(app: ^App) {
             move_cursor(right_x, y)
             set_bg(DETAIL_BG)
 
-            // Color logic:
-            // success (installed/removed) -> green action + white pkg
-            // failure -> red action + white pkg
-            // package name always the normal white used in left list
-            is_success := strings.has_prefix(line, "installed:") || strings.has_prefix(line, "removed:")
-            action_color := Color.BrightGreen
-            if !is_success {
+            // Color by line kind
+            action_color := COLOR_NORMAL
+            if strings.has_prefix(line, "marked for installation:") ||
+               strings.has_prefix(line, "installed:") {
+                action_color = Color.BrightGreen
+            } else if strings.has_prefix(line, "marked for removal:") ||
+                      strings.has_prefix(line, "removed:") {
                 action_color = Color.BrightRed
+            } else if strings.has_prefix(line, "failed") {
+                action_color = Color.BrightRed
+            } else if strings.has_prefix(line, "fetch") ||
+                      strings.has_prefix(line, "Fetched") ||
+                      strings.has_prefix(line, "sudo") ||
+                      strings.has_prefix(line, "password") {
+                action_color = Color.BrightYellow
             }
 
-            // Find split point for coloring
             colon_idx := strings.index(line, ": ")
             if colon_idx >= 0 {
                 action_part := line[:colon_idx+2]
                 pkg_part := line[colon_idx+2:]
 
-                // Truncate if needed to fit width
                 total_needed := len(action_part) + len(pkg_part)
                 if total_needed > right_width {
                     max_pkg := right_width - len(action_part) - 1
@@ -677,17 +724,15 @@ draw :: proc(app: ^App) {
 
                 set_fg(action_color)
                 write(action_part)
-                set_fg(COLOR_NORMAL)   // same white as left list names
+                set_fg(COLOR_NORMAL)
                 write(pkg_part)
 
-                // pad
                 written := len(action_part) + len(pkg_part)
                 if written < right_width {
                     write(strings.repeat(" ", right_width - written))
                 }
             } else {
-                // fallback
-                set_fg(COLOR_NORMAL)
+                set_fg(action_color)
                 txt := line
                 if len(txt) > right_width {
                     txt = strings.concatenate({txt[:right_width-1], "…"})
@@ -701,48 +746,19 @@ draw :: proc(app: ^App) {
         }
     }
 
-    // ---------------- Status bar ----------------
+    // ---------------- Status bar (keys only) ----------------
     status_y := h - 1
     move_cursor(1, status_y)
     set_bg(COLOR_STATUS_BG)
     set_fg(COLOR_STATUS_FG)
 
-    // Clear the line first
     for _ in 0..<w do write(" ")
     move_cursor(1, status_y)
 
-    // Pending summary
-    n_install := len(app.pending_install)
-    n_remove  := len(app.pending_remove)
-
-    if (n_install > 0) || (n_remove > 0) {
-        set_fg(Color.BrightYellow)
-        if n_install > 0 {
-            writef("%d to install", n_install)
-        }
-        if (n_install > 0) && (n_remove > 0) {
-            write("  ")
-        }
-        if n_remove > 0 {
-            writef("%d to remove", n_remove)
-        }
-        set_fg(COLOR_STATUS_FG)
-        write("   •   ")
-    }
-
-    // Key hints (context sensitive a bit)
-    write("↑↓/jk: move  i: mark install  u: mark uninstall  Enter: apply  r: reset  R: refresh  q: quit")
-
-    if app.last_error != "" {
-        set_fg(Color.BrightRed)
-        write("   ERROR: ")
-        write(app.last_error)
-        set_fg(COLOR_STATUS_FG)
-    } else if app.last_message != "" {
-        set_fg(Color.BrightGreen)
-        write("   ")
-        write(app.last_message)
-        set_fg(COLOR_STATUS_FG)
+    if password_entry_active {
+        write("sudo password  Enter: submit  Esc/Ctrl+C: cancel  (hidden in Recent Operations)")
+    } else {
+        write("↑↓/jk  Space: mark  Enter: apply  c: clear  f: fetch  ?: help  q: quit")
     }
 
     reset_attrs()
@@ -768,15 +784,21 @@ destroy_app :: proc(app: ^App) {
     delete(app.installed_set)
     delete(app.pending_install)
     delete(app.pending_remove)
+    for line in app.status_lines {
+        delete(line)
+    }
     delete(app.status_lines)
     if app.available != nil do delete(app.available)
     if app.installed != nil do delete(app.installed)
+    if draw_frame_backing != nil {
+        delete(draw_frame_backing)
+        draw_frame_backing = nil
+    }
 }
 
 // Load (or reload) data from deb-get
 refresh_data :: proc(app: ^App) -> bool {
     app.last_error = ""
-    app.last_message = ""
 
     avail, ok1 := get_available_packages()
     inst,  ok2 := get_installed_packages()
@@ -811,66 +833,148 @@ refresh_data :: proc(app: ^App) -> bool {
     return true
 }
 
-// Mark current left selection for install (if not already installed)
-toggle_mark_install :: proc(app: ^App) {
+// Context-aware toggle: not installed ↔ mark install; installed ↔ mark remove.
+// Recent Operations list is rebuilt from pending maps after every change.
+toggle_mark :: proc(app: ^App) {
     if len(app.available) == 0 do return
     if app.left_selection >= len(app.available) do return
 
     pkg := app.available[app.left_selection]
 
-    // Don't allow marking already installed packages for install
     if app.installed_set[pkg] {
-        app.last_message = fmt.tprintf("%s is already installed", pkg)
-        return
-    }
-
-    if app.pending_install[pkg] {
-        delete_key(&app.pending_install, pkg)
-        app.last_message = fmt.tprintf("Unmarked %s", pkg)
+        // Installed: toggle remove mark
+        if app.pending_remove[pkg] {
+            delete_key(&app.pending_remove, pkg)
+        } else {
+            app.pending_remove[pkg] = true
+            delete_key(&app.pending_install, pkg)
+        }
     } else {
-        app.pending_install[pkg] = true
-        // If it was somehow in remove (shouldn't happen), clear it
-        delete_key(&app.pending_remove, pkg)
-        app.last_message = fmt.tprintf("Marked %s for installation", pkg)
+        // Not installed: toggle install mark
+        if app.pending_install[pkg] {
+            delete_key(&app.pending_install, pkg)
+        } else {
+            app.pending_install[pkg] = true
+            delete_key(&app.pending_remove, pkg)
+        }
     }
+    sync_pending_ops_list(app)
     app.needs_redraw = true
 }
 
-// Mark current left selection for removal (only if it is installed)
-toggle_mark_remove :: proc(app: ^App) {
-    if len(app.available) == 0 do return
-    if app.left_selection >= len(app.available) do return
-
-    pkg := app.available[app.left_selection]
-
-    if !app.installed_set[pkg] {
-        app.last_message = fmt.tprintf("%s is not installed", pkg)
-        return
-    }
-
-    if app.pending_remove[pkg] {
-        delete_key(&app.pending_remove, pkg)
-        app.last_message = fmt.tprintf("Unmarked %s", pkg)
-    } else {
-        app.pending_remove[pkg] = true
-        // Remove from install queue if present (edge case)
-        delete_key(&app.pending_install, pkg)
-        app.last_message = fmt.tprintf("Marked %s for removal", pkg)
-    }
-    app.needs_redraw = true
-}
-
-// Clear all marks
-reset_marks :: proc(app: ^App) {
-    n := len(app.pending_install) + len(app.pending_remove)
+// Clear all pending install/remove marks and empty the staging list in RO.
+clear_marks :: proc(app: ^App) {
     clear(&app.pending_install)
     clear(&app.pending_remove)
-    if n > 0 {
-        app.last_message = "All marks cleared"
-    } else {
-        app.last_message = ""
+    clear_status_lines(app)
+    app.needs_redraw = true
+}
+
+// Fetch package lists from deb-get (rate-limited).
+fetch_list :: proc(app: ^App) {
+    now := time.to_unix_seconds(time.now())
+    if app.last_fetch_unix > 0 {
+        elapsed := now - app.last_fetch_unix
+        if elapsed < FETCH_COOLDOWN_SECONDS {
+            wait := FETCH_COOLDOWN_SECONDS - elapsed
+            // Keep pending mark lines; note cooldown at the end
+            sync_pending_ops_list(app)
+            append_status_line(app, fmt.tprintf("fetch cooldown: wait %ds", wait))
+            app.needs_redraw = true
+            return
+        }
+    }
+
+    if refresh_data(app) {
+        app.last_fetch_unix = time.to_unix_seconds(time.now())
+        if len(app.pending_install) > 0 || len(app.pending_remove) > 0 {
+            sync_pending_ops_list(app)
+            append_status_line(app, "fetched package lists from deb-get")
+        } else {
+            clear_status_lines(app)
+            append_status_line(app, "fetched package lists from deb-get")
+        }
+    } else if app.last_error != "" {
+        append_status_line(app, app.last_error)
     }
     app.needs_redraw = true
+}
+
+// Help text drawn in the package-details region when show_help is true.
+// Uses the frame allocator (caller is draw()).
+draw_help_pane :: proc(x, y, width, height: int) {
+    lines := [?]string{
+        "debtui — TUI front-end for deb-get",
+        "",
+        "Browse packages in the left list. Space toggles",
+        "a mark (install if free, remove if installed).",
+        "Enter applies all marks. Recent Operations shows",
+        "results of apply.",
+        "",
+        "Keys:",
+        "  ↑↓ / j k     Move selection",
+        "  PgUp / PgDn  Page up / down",
+        "  Home / End   First / last package",
+        "  Space        Toggle mark",
+        "  Enter        Apply all marks",
+        "  c            Clear all marks",
+        "  f            Fetch list (rate limited)",
+        "  ?            Toggle this help",
+        "  q / Ctrl+C   Quit",
+        "",
+        "On apply, if sudo needs a password it is",
+        "prompted in Recent Operations (masked).",
+        "",
+        "Markers:",
+        "  [i] installed   [+] install   [-] remove",
+        "",
+        "Press ? again to return to package details.",
+    }
+
+    row := 0
+    for line in lines {
+        if row >= height do break
+
+        // Soft-wrap long lines into the pane width
+        if len(line) == 0 {
+            row += 1
+            continue
+        }
+
+        if len(line) <= width {
+            move_cursor(x, y + row)
+            set_bg(DETAIL_BG)
+            if row == 0 {
+                set_fg(Color.BrightCyan)
+            } else if strings.has_prefix(line, "Keys:") || strings.has_prefix(line, "Markers:") {
+                set_fg(COLOR_HEADER)
+            } else {
+                set_fg(DETAIL_FG)
+            }
+            write(line)
+            pad := width - len(line)
+            if pad > 0 {
+                write(strings.repeat(" ", pad))
+            }
+            reset_attrs()
+            row += 1
+        } else {
+            wrapped := wrap_text(line, width)
+            for wl in wrapped {
+                if row >= height do break
+                move_cursor(x, y + row)
+                set_bg(DETAIL_BG)
+                set_fg(DETAIL_FG)
+                write(wl)
+                pad := width - len(wl)
+                if pad > 0 {
+                    write(strings.repeat(" ", pad))
+                }
+                reset_attrs()
+                row += 1
+            }
+        }
+    }
 }
 
 // Process all pending operations
@@ -887,13 +991,38 @@ apply_pending :: proc(app: ^App) {
     }
 
     if (len(to_install) == 0) && (len(to_remove) == 0) {
-        app.last_message = "Nothing to do"
+        clear_status_lines(app)
+        append_status_line(app, "nothing to do")
         app.needs_redraw = true
         return
     }
 
-    // Clear previous operation results and start fresh (per user spec)
+    // Clear staging marks list; fill with apply progress
     clear_status_lines(app)
+    app.needs_redraw = true
+    draw(app)
+
+    // Install/remove need root via deb-get's sudo. Prompt in Recent Operations
+    // (stdout/stderr are redirected, so a normal TTY sudo prompt would not work).
+    if !ensure_sudo_for_apply(app) {
+        // Marks stay pending so the user can fix auth and press Enter again.
+        // Rebuild mark lines, then re-append whatever sudo/password dialogue we showed.
+        dialogue := make([dynamic]string, 0, len(app.status_lines))
+        defer {
+            for s in dialogue { delete(s) }
+            delete(dialogue)
+        }
+        for line in app.status_lines {
+            append(&dialogue, strings.clone(line))
+        }
+        sync_pending_ops_list(app)
+        for line in dialogue {
+            append_status_line(app, line)
+        }
+        append_status_line(app, "apply cancelled: elevation required")
+        app.needs_redraw = true
+        return
+    }
 
     // Process one package at a time so we can report per-app status in the pane.
     // Installs first, then removes.
@@ -906,7 +1035,7 @@ apply_pending :: proc(app: ^App) {
             append_status_line(app, fmt.tprintf("failed to install: %s", p))
         }
         app.needs_redraw = true
-        draw(app)  // live update in status pane
+        draw(app)  // live update in Recent Operations
     }
 
     for p in to_remove {
@@ -931,13 +1060,167 @@ apply_pending :: proc(app: ^App) {
 
 // --------------------------- Status pane helpers (Recent Operations) -----------
 
+// Replace the last Recent Operations line (used for live password mask).
+replace_last_status_line :: proc(app: ^App, line: string) {
+    if len(app.status_lines) == 0 {
+        append_status_line(app, line)
+        return
+    }
+    last := len(app.status_lines) - 1
+    delete(app.status_lines[last])
+    app.status_lines[last] = strings.clone(line)
+}
+
+// Masked password entry in the Recent Operations panel.
+// Returns a heap-allocated password string; caller must zero_and_delete_string.
+read_password_in_ro :: proc(app: ^App) -> (password: string, ok: bool) {
+    password_entry_active = true
+    defer password_entry_active = false
+
+    append_status_line(app, "password:")
+    append_status_line(app, "")
+    draw(app)
+
+    buf: [512]byte
+    n := 0
+
+    for {
+        key := read_key()
+
+        switch k in key {
+        case Special_Key:
+            #partial switch k {
+            case .Enter:
+                pw := strings.clone(string(buf[:n]))
+                for i in 0..<n {
+                    buf[i] = 0
+                }
+                // Leave a non-secret confirmation line instead of the mask
+                replace_last_status_line(app, "(password entered)")
+                draw(app)
+                return pw, true
+
+            case .Backspace:
+                if n > 0 {
+                    n -= 1
+                    buf[n] = 0
+                }
+
+            case .Escape, .CtrlC:
+                for i in 0..<n {
+                    buf[i] = 0
+                }
+                replace_last_status_line(app, "(cancelled)")
+                draw(app)
+                return "", false
+
+            case:
+                // ignore other specials
+            }
+
+        case rune:
+            if k >= 32 && k < 127 && n < len(buf) {
+                buf[n] = u8(k)
+                n += 1
+            }
+
+        case Timeout:
+            sleep_ms(16)
+            continue
+
+        case Unknown_Escape:
+            // ignore
+        }
+
+        // Update mask row: only asterisks, never the real password
+        if n == 0 {
+            replace_last_status_line(app, "")
+        } else {
+            mask := strings.repeat("*", n)
+            replace_last_status_line(app, mask)
+        }
+        draw(app)
+    }
+}
+
+// Ensure sudo will not block deb-get install/remove. Prompts in RO if needed.
+ensure_sudo_for_apply :: proc(app: ^App) -> bool {
+    if running_as_root() {
+        append_status_line(app, "sudo: running as root")
+        draw(app)
+        return true
+    }
+
+    if !sudo_available() {
+        append_status_line(app, "sudo: not found (required for install/remove)")
+        draw(app)
+        return false
+    }
+
+    if sudo_credentials_cached() {
+        append_status_line(app, "sudo: credentials already cached")
+        draw(app)
+        return true
+    }
+
+    append_status_line(app, "sudo: password required for package changes")
+    draw(app)
+
+    pw, ok := read_password_in_ro(app)
+    if !ok {
+        append_status_line(app, "sudo: password entry cancelled")
+        draw(app)
+        return false
+    }
+    defer zero_and_delete_string(pw)
+
+    if !sudo_cache_credentials(pw) {
+        append_status_line(app, "sudo: authentication failed")
+        draw(app)
+        return false
+    }
+
+    append_status_line(app, "sudo: authenticated")
+    draw(app)
+    return true
+}
+
+// Rebuild Recent Operations from current pending maps (sorted, clean on unmark).
+sync_pending_ops_list :: proc(app: ^App) {
+    clear_status_lines(app)
+
+    if len(app.pending_install) > 0 {
+        installs := make([dynamic]string, 0, len(app.pending_install))
+        defer delete(installs)
+        for p in app.pending_install {
+            append(&installs, p)
+        }
+        slice.sort(installs[:])
+        for p in installs {
+            append_status_line(app, fmt.tprintf("marked for installation: %s", p))
+        }
+    }
+
+    if len(app.pending_remove) > 0 {
+        removes := make([dynamic]string, 0, len(app.pending_remove))
+        defer delete(removes)
+        for p in app.pending_remove {
+            append(&removes, p)
+        }
+        slice.sort(removes[:])
+        for p in removes {
+            append_status_line(app, fmt.tprintf("marked for removal: %s", p))
+        }
+    }
+}
+
 append_status_line :: proc(app: ^App, line: string) {
-    append(&app.status_lines, line)
+    // Clone so callers may pass fmt.tprintf / other temporary strings.
+    append(&app.status_lines, strings.clone(line))
 
     // Auto-scroll if we were at or near the bottom
     viewport := max(1, get_status_viewport_height())
     if len(app.status_lines) > viewport {
-        // if previously at bottom, keep at bottom
         if app.status_scroll >= len(app.status_lines) - viewport - 1 {
             app.status_scroll = len(app.status_lines) - viewport
         }
@@ -947,16 +1230,20 @@ append_status_line :: proc(app: ^App, line: string) {
 }
 
 clear_status_lines :: proc(app: ^App) {
+    for line in app.status_lines {
+        delete(line)
+    }
     clear(&app.status_lines)
     app.status_scroll = 0
 }
 
+// Visible log lines under the fixed mid-screen Recent Operations header.
 get_status_viewport_height :: proc() -> int {
     h := term_height
-    right_content_h := h - 1 - 3   // rough, above global status bar, below header area
-    if right_content_h < 4 do right_content_h = 4
-    details_portion := max(4, right_content_h * 25 / 100)
-    return right_content_h - details_portion - 1  // -1 for the "Recent Operations" header
+    list_start_y := 3
+    ro_y := recent_ops_header_y(h, list_start_y)
+    // Rows from ro_y+1 through h-2 inclusive (above bottom status bar)
+    return max(0, (h - 1) - (ro_y + 1))
 }
 
 // -----------------------------------------------------------------------------
@@ -1039,32 +1326,28 @@ confirm_and_maybe_apply_on_quit :: proc(app: ^App) -> bool {
 
 // Handle a key press. Returns true if we should continue the main loop.
 handle_key :: proc(app: ^App, key: Key) -> bool {
-    app.last_error = ""
-    app.last_message = ""
-
     switch k in key {
     case Special_Key:
         #partial switch k {
         case .Up, .Down:
             delta := 1 if k == .Down else -1
             // Use the actual available height of the list panel (matches draw())
-            vp := term_height - 5
+            vp := term_height - 4
             move_selection(&app.left_selection, &app.left_scroll, len(app.available), delta, vp)
             app.needs_redraw = true
 
         case .Enter:
-            clear_status_lines(app)
             apply_pending(app)
 
         case .PageUp, .PageDown:
             dir := 1 if k == .PageDown else -1
-            vp := term_height - 5
+            vp := term_height - 4
             page_move(&app.left_selection, &app.left_scroll, len(app.available), dir, vp)
             app.needs_redraw = true
 
         case .Home, .End:
             to_end := k == .End
-            vp := term_height - 5
+            vp := term_height - 4
             jump_to(&app.left_selection, &app.left_scroll, len(app.available), to_end, vp)
             app.needs_redraw = true
 
@@ -1078,7 +1361,8 @@ handle_key :: proc(app: ^App, key: Key) -> bool {
             }
 
         case .CtrlR:
-            refresh_data(app)
+            // Same as f — rate-limited list fetch
+            fetch_list(app)
 
         case:
             // ignore other specials for now
@@ -1087,47 +1371,33 @@ handle_key :: proc(app: ^App, key: Key) -> bool {
     case rune:
         switch k {
         case 'q', 'Q':
+            // Terminal restore is handled solely by shutdown_terminal / atexit.
             if confirm_and_maybe_apply_on_quit(app) {
-			        // Clear screen
-			        set_fg(Color.White)
-			        set_bg(BgColor.Black)
-			        reset_attrs()		// none of these does nothing. There's got to be a way to restore default terminal colors and send 'clear'/'cls'
-			        fmt.print("\x1b[2J\x1b[H")
-              app.running = false
+                app.running = false
             }
 
-        case 'i', 'I':
-            toggle_mark_install(app)
+        case ' ':
+            toggle_mark(app)
 
-        case 'u', 'U':
-            toggle_mark_remove(app)
+        case 'c', 'C':
+            clear_marks(app)
 
-        case 'r':
-            reset_marks(app)
-
-        case 'R':
-            refresh_data(app)
-            clear_status_lines(app)
-            app.last_message = "Refreshed from deb-get"
+        case 'f', 'F':
+            fetch_list(app)
 
         case 'j', 'J':
-            vp := term_height - 5
+            vp := term_height - 4
             move_selection(&app.left_selection, &app.left_scroll, len(app.available), +1, vp)
             app.needs_redraw = true
 
         case 'k', 'K':
-            vp := term_height - 5
+            vp := term_height - 4
             move_selection(&app.left_selection, &app.left_scroll, len(app.available), -1, vp)
             app.needs_redraw = true
 
-        // h/l no longer switch panes (single list mode)
-
-        case '/':
-            // Future: filtering
-            app.last_message = "Search/filter not implemented yet"
-
         case '?':
-            app.last_message = "i: mark install  u: mark uninstall  Enter: apply  r: reset  R: refresh  q: quit"
+            app.show_help = !app.show_help
+            app.needs_redraw = true
 
         case:
             // unknown char - ignore
@@ -1146,10 +1416,45 @@ handle_key :: proc(app: ^App, key: Key) -> bool {
 // After apply_pending we show the command output in a simple "press any key" screen
 // (kept for now but no longer triggered; output now lives in the Recent Operations pane)
 show_process_result :: proc(app: ^App) {
-    // The new status pane in the right column replaces this full-screen result view.
-    app.last_message = ""
+    // The status pane in the right column replaces this full-screen result view.
     app.last_error = ""
     app.needs_redraw = true
+}
+
+// Print a short session summary on the primary screen after terminal restore.
+// Plain text only — no ANSI colors (uses the user's default terminal colors).
+print_exit_summary :: proc(app: ^App) {
+    fmt.printf("debtui %s — session summary\n", DEBTUI_VERSION)
+    fmt.printf("  packages available:  %d\n", len(app.available))
+    fmt.printf("  packages installed:  %d\n", len(app.installed))
+
+    n_pending := len(app.pending_install) + len(app.pending_remove)
+    if n_pending > 0 {
+        fmt.printf("  pending (not applied): %d install, %d remove\n",
+            len(app.pending_install), len(app.pending_remove))
+    }
+
+    if len(app.status_lines) > 0 {
+        fmt.println("  recent operations:")
+        // Cap so a long session does not flood the shell
+        max_lines := 20
+        start := 0
+        if len(app.status_lines) > max_lines {
+            start = len(app.status_lines) - max_lines
+            fmt.printf("    … %d earlier lines omitted\n", start)
+        }
+        for i in start..<len(app.status_lines) {
+            fmt.printf("    %s\n", app.status_lines[i])
+        }
+    } else {
+        fmt.println("  recent operations:    (none this session)")
+    }
+
+    if app.last_error != "" {
+        fmt.printf("  last error: %s\n", app.last_error)
+    }
+
+    fmt.println("Goodbye.")
 }
 
 // --------------------------- Main --------------------------------------------
@@ -1177,10 +1482,11 @@ main :: proc() {
     app := init_app()
     defer destroy_app(&app)
 
-    // Initial data load
-    if !refresh_data(&app) {
-        // Still continue — user will see error in status
+    // Initial data load (counts as a fetch for cooldown purposes)
+    if refresh_data(&app) {
+        app.last_fetch_unix = time.to_unix_seconds(time.now())
     }
+    // Still continue on failure — user will see error in status
     if verbose {
         log_cache_error(fmt.tprintf("main: refresh_data completed, available=%d packages, initial_selection=%d", len(app.available), app.left_selection))
         if len(app.available) > 0 {
@@ -1232,6 +1538,9 @@ main :: proc() {
         sleep_ms(5)
     }
 
-    // Clean exit message (optional)
-    fmt.println("\r\ndebtui exited cleanly.")
+    // Leave alt-screen, clear primary buffer, restore cooked mode, then
+    // print a plain-text summary with the user's default terminal colors.
+    // (defer shutdown_terminal is then a no-op via terminal_restored.)
+    shutdown_terminal()
+    print_exit_summary(&app)
 }

@@ -1,0 +1,14 @@
+# Build output
+/debtui
+*.o
+*.obj
+
+# Editor / OS
+.DS_Store
+*~
+*.swp
+*.swo
+
+# Local debug / cache (never commit)
+/tmp/
+cache-errors-*.log

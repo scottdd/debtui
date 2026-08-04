@@ -6,10 +6,11 @@ A terminal user interface (TUI) front-end for [deb-get](https://github.com/wimpy
 
 - Browse all packages available through deb-get in a single scrollable list (left pane)
 - View detailed information for the currently selected package (right pane)
-- Mark packages directly for installation (`i`) or uninstallation (`u`) from the main list
+- Toggle install/remove marks with `Space` (context-aware)
 - Apply all marked operations at once with `Enter`
-- Reset all marks with `r`
-- 'Recent Operations' pane shows success or failure for each recent install/uninstall action
+- Clear all marks with `c`; re-fetch package lists with `f` (rate limited)
+- **Recent Operations** pane (fixed mid-screen header) shows install/remove results
+- In-app help (`?`) in the package-details pane
 
 ## Background
 
@@ -17,15 +18,21 @@ This application is clanker code. I am learning Odin, and plan to build a fleet 
 
 ## Prerequisites
 
+- **Linux** (termios / ANSI alternate screen)
 - [Odin compiler](https://odin-lang.org/docs/install/)
 - [deb-get](https://github.com/wimpysworld/deb-get) installed and available in `$PATH`
 - A modern terminal that supports ANSI escape codes and the alternate screen buffer
 
 ## Build & Run
 
+**Build from source only.** Do not run prebuilt binaries from untrusted sources.
+
 ```bash
 # Build
 odin build src -out:debtui -o:speed
+
+# Or with the project script (enables -vet)
+./build.sh
 
 # Run
 ./debtui
@@ -64,18 +71,20 @@ Example:
 ### Marking & Actions
 | Key     | Action                                           |
 |---------|--------------------------------------------------|
-| `i`     | Mark selected package for **installation**       |
-| `u`     | Mark selected package for **uninstallation**     |
-| `Enter` | Apply all marked install and uninstall operations |
-| `r`     | Clear all pending marks                          |
+| `Space` | **Toggle mark** — install if not installed, remove if installed; press again to unmark |
+| `Enter` | Apply all marked install and remove operations   |
+| `c`     | Clear all pending marks                          |
 
 ### Other
 | Key       | Action                                   |
 |-----------|------------------------------------------|
+| `f`       | Fetch package lists from deb-get (rate limited: 30s cooldown) |
+| `?`       | Toggle help in the package-details pane  |
 | `q` / `Q` | Quit                                     |
-| `R`       | Refresh package lists from deb-get       |
-| `?`       | Show keybindings in the status bar       |
-| `Ctrl+C`  | Force quit                               |
+| `Ctrl+C`  | Quit (same as `q`)                       |
+| `Ctrl+R`  | Same as `f` (fetch, rate limited)        |
+
+`U` is reserved for a future **Update indexes** action.
 
 ## Interface
 
@@ -83,12 +92,9 @@ Example:
   - `[i]` = already installed via deb-get
   - `[+]` = marked for installation
   - `[-]` = marked for uninstallation
-- **Right pane**: Detailed information about the currently selected package.
-- **Status bar**: Shows pending operations and a throbber (`| / - \`) while packages are being installed or removed.
-
-## Screenshots
-
-(Screenshots coming soon)
+- **Right pane (top)**: Detailed information about the currently selected package (above the selection row).
+- **Recent Operations**: Fixed mid-screen header. While staging: `marked for installation/removal: pkg` (list rebuilds on unmark). After **Enter**: optional **sudo password** prompt (masked), then apply progress (`installed:`, `removed:`, failures). Other notes (fetch, cooldown) also appear here.
+- **Status bar**: Key hints only (changes during password entry).
 
 ## How It Works
 

@@ -11,11 +11,104 @@ import "core:time"
 import "core:path/filepath"
 import "core:c/libc"
 import "core:mem"
+import "core:sys/posix"
 
 // ============================================================================
 // deb-get integration layer
 // Uses libc.system + temp file for reliable output capture across platforms
 // ============================================================================
+
+// Create a private, exclusive temp file path for deb-get output capture.
+// Avoids a fixed world-writable path under /tmp (race / hijack risk).
+make_debget_temp_path :: proc() -> (path: string, ok: bool) {
+    f, err := os.create_temp_file("", "debtui-*.out")
+    if err != nil {
+        return "", false
+    }
+    // Clone the path before close; the file stays on disk for the shell redirect.
+    path = strings.clone(os.name(f))
+    os.close(f)
+    return path, true
+}
+
+// Shell-escape a path for single-quoted use in a system() command line.
+shell_quote :: proc(s: string, allocator := context.allocator) -> string {
+    sb: strings.Builder
+    strings.builder_init(&sb, allocator)
+    strings.write_byte(&sb, '\'')
+    for ch in s {
+        if ch == '\'' {
+            strings.write_string(&sb, "'\\''")
+        } else {
+            strings.write_rune(&sb, ch)
+        }
+    }
+    strings.write_byte(&sb, '\'')
+    return strings.to_string(sb)
+}
+
+// True if we are root (no elevation needed).
+running_as_root :: proc() -> bool {
+    return posix.geteuid() == 0
+}
+
+// True if sudo is available on PATH.
+sudo_available :: proc() -> bool {
+    return libc.system(cstring("command -v sudo >/dev/null 2>&1")) == 0
+}
+
+// True if sudo will not ask for a password right now (cached credentials or NOPASSWD).
+sudo_credentials_cached :: proc() -> bool {
+    return libc.system(cstring("sudo -n true >/dev/null 2>&1")) == 0
+}
+
+// Overwrite heap string bytes then free (for password wipe).
+zero_and_delete_string :: proc(s: string) {
+    if len(s) == 0 {
+        return
+    }
+    p := raw_data(s)
+    for i in 0..<len(s) {
+        p[i] = 0
+    }
+    delete(s)
+}
+
+// Cache sudo credentials using password on stdin (-S). Does not put the password
+// on the process command line (writes a 0600 temp file, redirects into sudo).
+sudo_cache_credentials :: proc(password: string) -> bool {
+    path, ok := make_debget_temp_path()
+    if !ok {
+        return false
+    }
+    defer {
+        os.remove(path)
+        delete(path)
+    }
+
+    // Restrict to owner only (create_temp_file may use broader perms).
+    _ = os.change_mode(path, os.perm_number(0o600))
+
+    data := make([]byte, len(password) + 1)
+    defer {
+        for i in 0..<len(data) {
+            data[i] = 0
+        }
+        delete(data)
+    }
+    if len(password) > 0 {
+        copy(data, transmute([]u8)password)
+    }
+    data[len(password)] = '\n'
+
+    if os.write_entire_file(path, data) != nil {
+        return false
+    }
+
+    cmd := fmt.tprintf("sudo -S -v < %s 2>/dev/null", shell_quote(path, context.temp_allocator))
+    ccmd := strings.clone_to_cstring(cmd, context.temp_allocator)
+    return libc.system(ccmd) == 0
+}
 
 // Run a deb-get command and return (combined_output, success)
 run_debget :: proc(args: ..string) -> (output: string, ok: bool) {
@@ -30,24 +123,22 @@ run_debget :: proc(args: ..string) -> (output: string, ok: bool) {
 
     strings.write_string(&sb, "deb-get")
     for a in args {
-        strings.write_string(&sb, " '")
-        // Very naive escaping: replace ' with '\'' 
-        for ch in a {
-            if ch == '\'' {
-                strings.write_string(&sb, "'\\''")
-            } else {
-                strings.write_rune(&sb, ch)
-            }
-        }
-        strings.write_string(&sb, "'")
+        strings.write_string(&sb, " ")
+        strings.write_string(&sb, shell_quote(a, context.temp_allocator))
     }
 
     cmdline := strings.to_string(sb)
 
-    // Use a predictable temp file for output capture.
-    // This is simple and avoids tricky libc FILE binding differences across Odin versions.
-    tmpfile := "/tmp/debtui_debget.out"
-    full_cmd := fmt.tprintf("%s > '%s' 2>&1", cmdline, tmpfile)
+    tmpfile, tmp_ok := make_debget_temp_path()
+    if !tmp_ok {
+        return "(failed to create private temp file for deb-get output)", false
+    }
+    defer {
+        os.remove(tmpfile)
+        delete(tmpfile)
+    }
+
+    full_cmd := fmt.tprintf("%s > %s 2>&1", cmdline, shell_quote(tmpfile, context.temp_allocator))
 
     ccmd := strings.clone_to_cstring(full_cmd, context.temp_allocator)
     ret := libc.system(ccmd)
@@ -56,8 +147,6 @@ run_debget :: proc(args: ..string) -> (output: string, ok: bool) {
     data, read_err := os.read_entire_file_from_path(tmpfile, context.allocator)
     if read_err == nil {
         output = string(data)
-        // Clean up temp file (ignore errors)
-        os.remove(tmpfile)
     } else {
         output = fmt.tprintf("(failed to read command output from %s)", tmpfile)
     }
@@ -375,6 +464,10 @@ get_package_details :: proc(pkg: string) -> (Package_Details, bool) {
 
 // cleanup_persistent_cache removes old cache entries (>7 days) and entries for
 // packages that are no longer available in deb-get.
+//
+// Uses os.read_all_directory_by_path + file_info_slice_delete so directory
+// entries are freed with the API that allocated them (avoids the prior
+// manual delete(e.name) SIGSEGV).
 cleanup_persistent_cache :: proc(available: []string) {
     log_cache_error("starting cache cleanup pass")
     dir := get_cache_dir()
@@ -389,164 +482,114 @@ cleanup_persistent_cache :: proc(available: []string) {
         available_set[p] = true
     }
 
-    fd, err := os.open(dir, os.O_RDONLY)
-    if err != os.ERROR_NONE {
-        log_cache_error("failed to open cache dir for cleanup")
-        return
-    }
-    defer os.close(fd)
-
-    // Read directory using the permanent allocator. The resulting entry.name
-    // strings must be deleted by us (or left for process exit).
-    entries, read_err := os.read_dir(fd, -1, context.allocator)
-    if read_err != os.ERROR_NONE {
+    entries, read_err := os.read_all_directory_by_path(dir, context.allocator)
+    if read_err != nil {
         log_cache_error("failed to read cache dir entries")
         return
     }
+    defer os.file_info_slice_delete(entries, context.allocator)
 
     now := time.to_unix_seconds(time.now())
 
-    S_IFDIR :: 0o040000
+    // Per-file scratch (JSON, paths for logs) lives in a scratch arena so the
+    // permanent allocator only holds the File_Info slice we free above.
+    arena_backing := make([]byte, 8 * 1024 * 1024)
+    defer delete(arena_backing)
 
-    // --- Use a temporary arena for the body of the cleanup work ---
-    //
-    // All the per-file allocations (full_path, file data, json unmarshal
-    // strings, fmt strings for logging, etc.) go into this arena and are
-    // freed in one shot when the arena is destroyed. This leaves the main
-    // allocator in a clean state so we can safely delete the Dir_Entry
-    // name strings afterwards.
-    {
-        // 8 MiB is plenty for processing a few hundred cache files.
-        arena_backing := make([]byte, 8 * 1024 * 1024)
-        defer delete(arena_backing)
+    arena: mem.Arena
+    mem.arena_init(&arena, arena_backing)
+    scratch := mem.arena_allocator(&arena)
 
-        arena: mem.Arena
-        mem.arena_init(&arena, arena_backing)
-
-        prev_context := context
-        context.allocator = mem.arena_allocator(&arena)
-        defer context = prev_context
-
-        for entry in entries {
-            mode := transmute(u32)entry.mode
-            if mode & S_IFDIR != 0 { continue }  // S_IFDIR on Unix-like systems
-
-            name := entry.name
-
-            full_path, _ := filepath.join({dir, name})
-            defer delete(full_path)
-
-            if strings.has_suffix(name, ".tmp") {
-                log_cache_error("removing stray .tmp file from previous atomic write", full_path)
-                os.remove(full_path)
-                continue
-            }
-
-            if !strings.has_suffix(name, ".json") { continue }
-
-            if verbose {
-                log_cache_error("cleanup: examining cache file", full_path)
-            }
-
-            data, file_read_err := os.read_entire_file_from_path(full_path, context.allocator)
-            if file_read_err != nil {
-                log_cache_error("cleanup: failed to read file, removing", full_path)
-                os.remove(full_path)
-                continue
-            }
-            defer delete(data, context.allocator)
-
-            if verbose {
-                log_cache_error(fmt.tprintf("cleanup: read %d bytes", len(data)), full_path)
-            }
-
-            // Guard against huge files (old raw blobs etc.)
-            if len(data) > 4 * 1024 * 1024 {
-                log_cache_error("cleanup: file too large (>4 MiB), deleting", full_path)
-                os.remove(full_path)
-                continue
-            }
-
-            cached: Cached_Details
-            if verbose {
-                log_cache_error("cleanup: attempting json unmarshal", full_path)
-            }
-            if json.unmarshal(data, &cached) != nil {
-                log_cache_error("json unmarshal failed during cleanup", full_path)
-                os.remove(full_path)
-                continue
-            }
-
-            if verbose {
-                log_cache_error(fmt.tprintf("cleanup: unmarshal OK (raw_len=%d, summary_len=%d, pkg=%s)", len(cached.details.raw), len(cached.details.summary), cached.details.package_name), full_path)
-            }
-
-            // Never trust persisted raw data
-            cached.details.raw = ""
-
-            if verbose {
-                log_cache_error("cleanup: about to run is_details_sane", full_path)
-            }
-            if !is_details_sane(cached.details) {
-                log_cache_error("sanity check failed during cleanup", full_path)
-                os.remove(full_path)
-                continue
-            }
-
-            if verbose {
-                log_cache_error(fmt.tprintf("cleanup: sane, cached_at=%d, now=%d, age=%d", cached.cached_at, now, now - cached.cached_at), full_path)
-            }
-
-            // Remove if too old
-            if now - cached.cached_at > CACHE_TTL_SECONDS {
-                log_cache_error("removing stale cache file (7-day TTL)", full_path)
-                os.remove(full_path)
-                continue
-            }
-
-            pkg := cached.details.package_name
-            if pkg == "" {
-                log_cache_error("cleanup: package_name empty in JSON, reconstructing from filename", full_path)
-                // Best-effort reconstruction from filename
-                pkg = strings.trim_suffix(name, ".json")
-                pkg, _ = strings.replace_all(pkg, "_", "/")
-            }
-
-            if verbose {
-                log_cache_error(fmt.tprintf("cleanup: using pkg key for map lookup: '%s'", pkg), full_path)
-                log_cache_error("cleanup: performing available_set map lookup", full_path)
-            }
-
-            // Remove if the package no longer exists in deb-get
-            if !available_set[pkg] {
-                log_cache_error("removing cache for package no longer in deb-get", full_path)
-                os.remove(full_path)
-            } else if verbose {
-                log_cache_error("cleanup: keeping valid cache file", full_path)
-            }
+    for entry in entries {
+        if entry.type == .Directory {
+            continue
         }
 
-        log_cache_error("cleanup: finished scanning all entries")
+        name := entry.name
+        full_path := entry.fullpath
+
+        if strings.has_suffix(name, ".tmp") {
+            log_cache_error("removing stray .tmp file from previous atomic write", full_path)
+            os.remove(full_path)
+            continue
+        }
+
+        if !strings.has_suffix(name, ".json") {
+            continue
+        }
+
+        if verbose {
+            log_cache_error("cleanup: examining cache file", full_path)
+        }
+
+        free_all(scratch)
+        prev_alloc := context.allocator
+        context.allocator = scratch
+
+        data, file_read_err := os.read_entire_file_from_path(full_path, scratch)
+        if file_read_err != nil {
+            context.allocator = prev_alloc
+            log_cache_error("cleanup: failed to read file, removing", full_path)
+            os.remove(full_path)
+            continue
+        }
+
+        if verbose {
+            log_cache_error(fmt.tprintf("cleanup: read %d bytes", len(data)), full_path)
+        }
+
+        if len(data) > 4 * 1024 * 1024 {
+            context.allocator = prev_alloc
+            log_cache_error("cleanup: file too large (>4 MiB), deleting", full_path)
+            os.remove(full_path)
+            continue
+        }
+
+        cached: Cached_Details
+        if json.unmarshal(data, &cached, allocator=scratch) != nil {
+            context.allocator = prev_alloc
+            log_cache_error("json unmarshal failed during cleanup", full_path)
+            os.remove(full_path)
+            continue
+        }
+
+        cached.details.raw = ""
+
+        if !is_details_sane(cached.details) {
+            context.allocator = prev_alloc
+            log_cache_error("sanity check failed during cleanup", full_path)
+            os.remove(full_path)
+            continue
+        }
+
+        if now - cached.cached_at > CACHE_TTL_SECONDS {
+            context.allocator = prev_alloc
+            log_cache_error("removing stale cache file (7-day TTL)", full_path)
+            os.remove(full_path)
+            continue
+        }
+
+        pkg := cached.details.package_name
+        if pkg == "" {
+            // Best-effort reconstruction from filename (arena-backed)
+            pkg = strings.trim_suffix(name, ".json")
+            pkg, _ = strings.replace_all(pkg, "_", "/", allocator = scratch)
+        }
+
+        // Map lookup uses permanent available_set; keys are package names
+        // from the outer list (not arena memory).
+        keep := available_set[pkg]
+        context.allocator = prev_alloc
+
+        if !keep {
+            log_cache_error("removing cache for package no longer in deb-get", full_path)
+            os.remove(full_path)
+        } else if verbose {
+            log_cache_error("cleanup: keeping valid cache file", full_path)
+        }
     }
-    // The arena has now been destroyed. All the temporary allocations from
-    // the per-file work (full_path, file data, json strings, log formatting,
-    // etc.) have been released in one shot.
 
-    // We intentionally do *not* delete the Dir_Entry names here.
-    // Even after isolating all the heavy work to a temporary arena, the
-    // final batch delete(e.name) on the results from os.read_dir has proven
-    // unreliable and can still SIGSEGV. The important work (scanning for
-    // stale/expired/obsolete .json files and calling os.remove on them) has
-    // already completed safely inside the loop.
-    //
-    // Leaking the ~20 tiny filename strings from read_dir is completely
-    // harmless for a long-running TUI (they are reclaimed on process exit).
-    log_cache_error(fmt.tprintf("cleanup: not cleaning up %d read_dir entries (intentionally leaked to avoid allocator crash)", len(entries)))
-
-    // (Previously attempted:)
-    // for e in entries { delete(e.name) }
-    // delete(entries)
-
+    log_cache_error(fmt.tprintf("cleanup: finished scanning %d entries", len(entries)))
     log_cache_error("cleanup: returning from cleanup_persistent_cache")
 }
 

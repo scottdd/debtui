@@ -113,18 +113,32 @@ Special_Key :: enum {
     // Add more as needed
 }
 
-// Restore terminal state (registered via atexit for safety)
+// Restore terminal state (registered via atexit for safety).
+// Safe to call multiple times; subsequent calls are no-ops.
+// Order: reset attrs → show cursor → leave alt screen → clear primary → restore termios.
 restore_terminal :: proc "c" () {
     if terminal_restored do return
     context = runtime.default_context()
 
-    posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &termios_original)
-    // Best effort restores
+    // Best-effort visual restore first (still in whatever mode we left)
     os.write_string(os.stderr, CSI)
-    os.write_string(os.stderr, ALT_SCREEN_OFF)
+    os.write_string(os.stderr, "0m")           // reset SGR (colors/attrs)
     os.write_string(os.stderr, CSI)
     os.write_string(os.stderr, CURSOR_SHOW)
-    os.write_string(os.stderr, "\r\n")
+    os.write_string(os.stderr, CSI)
+    os.write_string(os.stderr, ALT_SCREEN_OFF)
+
+    // Wipe the primary screen so no TUI residue (or pre-app junk) remains.
+    // Uses default terminal colors — no forced black/white from the TUI.
+    os.write_string(os.stderr, CSI)
+    os.write_string(os.stderr, "0m")
+    os.write_string(os.stderr, CSI)
+    os.write_string(os.stderr, CLEAR_SCREEN)
+    os.write_string(os.stderr, CSI)
+    os.write_string(os.stderr, HOME)
+
+    // Restore cooked terminal modes last
+    posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &termios_original)
     terminal_restored = true
 }
 
