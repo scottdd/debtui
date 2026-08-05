@@ -7,11 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-04
+
+### Added
+
+- Full-height help (`?`): uses the entire right column (package details + Recent Operations); RO is restored when help is closed.
+
 ### Changed
 
-- Documentation and help aligned with 0.3.0 behavior (keys, dpkg prerequisite, quit-with-pending, Updater field).
+- Documentation and help aligned with 0.3.x behavior (keys, dpkg prerequisite, quit-with-pending, Updater field).
 - Exit summary reports pending work as `install/update` and `remove`.
 - Removed unused full-screen process-result helper (output lives in Recent Operations).
+- Version **0.3.1**.
 
 ## [0.3.0] - 2026-08-04
 
@@ -58,5 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Basic keyboard navigation and marking workflow (evolved through early commits).
 
 [Unreleased]: https://github.com/scottdd/debtui/compare/main...HEAD
+[0.3.1]: https://github.com/scottdd/debtui/commits/main
 [0.3.0]: https://github.com/scottdd/debtui/commits/main
 [0.2.0]: https://github.com/scottdd/debtui/commits/main

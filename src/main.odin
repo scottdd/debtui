@@ -14,7 +14,7 @@ import "core:unicode/utf8"
 // Set while the RO panel is collecting a sudo password (status bar hint changes).
 password_entry_active := false
 
-DEBTUI_VERSION :: "0.3.0"
+DEBTUI_VERSION :: "0.3.1"
 
 // Global verbose flag controlled by --verbose / -v.
 // When false, we suppress the detailed diagnostic logging that was added
@@ -48,7 +48,8 @@ draw_frame_arena: mem.Arena
 //   c     — clear all marks; re-hint if session still knows about updates.
 //   Enter — apply pending installs/updates then removes (sudo via RO if needed).
 //   Esc   — cancel remaining work during a long update scan (partial marks kept).
-// Details pane follows left selection (or Help when show_help).
+// Details pane follows left selection. Help (?): full right column height
+// (details + Recent Operations); RO is restored when help is dismissed.
 // ============================================================================
 
 // Minimum seconds between user-initiated list fetches (f). Startup counts as a fetch.
@@ -97,7 +98,7 @@ App :: struct {
     needs_redraw: bool,
     running:      bool,
     last_error:   string,      // for exit summary / rare failures (not status bar)
-    show_help:    bool,        // right pane shows help instead of package details
+    show_help:    bool,        // full right column = help; hides Recent Operations until toggled off
 
     // Rate limit for f (Fetch list)
     last_fetch_unix: i64,
@@ -617,8 +618,23 @@ draw :: proc(app: ^App) {
         draw_list_item(left_x, y, left_width, pkg, is_sel, is_inst, is_pend && !is_pend_upd, is_pend_rm, is_pend_upd)
     }
 
-    // ---------------- RIGHT: details above mid-screen; RO header fixed; log below ----------------
+    // ---------------- RIGHT: details + RO, or full-height Help ----------------
+    // Help uses the full right column (details band + Recent Operations band)
+    // down to the row above the bottom status bar. RO is not drawn while help is open.
+    right_full_h := detail_h + status_portion_h
 
+    if app.show_help {
+        for i in 0..<right_full_h {
+            move_cursor(right_x, detail_y + i)
+            set_bg(DETAIL_BG)
+            set_fg(DETAIL_FG)
+            write(strings.repeat(" ", right_width))
+            reset_attrs()
+        }
+        if right_full_h > 0 {
+            draw_help_pane(right_x, detail_y, right_width, right_full_h)
+        }
+    } else {
     // Blank the details portion
     for i in 0..<detail_h {
         move_cursor(right_x, detail_y + i)
@@ -629,10 +645,8 @@ draw :: proc(app: ^App) {
         reset_attrs()
     }
 
-    // Show help or package details (above Recent Operations)
-    if detail_h > 0 && app.show_help {
-        draw_help_pane(right_x, detail_y, right_width, detail_h)
-    } else if detail_h > 0 && (len(app.available) > 0) && (app.left_selection < len(app.available)) {
+    // Package details (above Recent Operations)
+    if detail_h > 0 && (len(app.available) > 0) && (app.left_selection < len(app.available)) {
         sel_pkg := app.available[app.left_selection]
         det := app.details_cache[sel_pkg]
 
@@ -809,6 +823,7 @@ draw :: proc(app: ^App) {
     }
 
     // ---------------- Recent Operations (fixed mid-screen header) ----------------
+    // Hidden while full-height help is open; restored on next draw after help toggles off.
     if status_portion_h > 0 {
         // Blank the status portion (header + log)
         for i in 0..<status_portion_h {
@@ -914,6 +929,7 @@ draw :: proc(app: ^App) {
             reset_attrs()
         }
     }
+    } // end !show_help (details + Recent Operations)
 
     // ---------------- Status bar (keys only) ----------------
     status_y := h - 1
@@ -1258,7 +1274,7 @@ fetch_list :: proc(app: ^App) {
     app.needs_redraw = true
 }
 
-// Help text drawn in the package-details region when show_help is true.
+// Help text for the full right column (details + RO height) when show_help is true.
 // Uses the frame allocator (caller is draw()).
 draw_help_pane :: proc(x, y, width, height: int) {
     lines := [?]string{
@@ -1290,7 +1306,8 @@ draw_help_pane :: proc(x, y, width, height: int) {
         "  [i] installed  [↑] update  [+] install",
         "  [-] remove",
         "",
-        "Press ? again to return to package details.",
+        "Press ? again to restore details and",
+        "Recent Operations.",
     }
 
     row := 0

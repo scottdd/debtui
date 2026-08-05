@@ -12,7 +12,7 @@ A terminal user interface (TUI) front-end for [deb-get](https://github.com/wimpy
 - Apply all marked operations at once with `Enter` (installs, updates, removes)
 - Clear all marks with `c`; re-fetch package lists with `f` (rate limited)
 - **Recent Operations** pane (fixed mid-screen header) shows staging and apply results
-- In-app help (`?`) in the package-details pane
+- In-app help (`?`) uses the full right column (details + Recent Operations); RO returns when help is closed
 - Quit with pending marks prompts to apply them first (timeout defaults to leave pending)
 
 ## Background
@@ -85,7 +85,7 @@ Example:
 | Key       | Action                                   |
 |-----------|------------------------------------------|
 | `f`       | Fetch package lists from deb-get (rate limited: 30s cooldown) |
-| `?`       | Toggle help in the package-details pane  |
+| `?`       | Toggle full-height help on the right (hides Recent Operations until closed) |
 | `q` / `Q` | Quit (if marks are pending, prompt to apply first) |
 | `Ctrl+C`  | Quit (same as `q`)                       |
 | `Ctrl+R`  | Same as `f` (fetch, rate limited)        |
@@ -97,8 +97,8 @@ Example:
   - `[↑]` = marked for update (upgrade)
   - `[+]` = marked for installation
   - `[-]` = marked for uninstallation
-- **Right pane (top)**: Detailed information about the currently selected package (above the selection row), including Updater, Installed, and Published when known.
-- **Recent Operations**: Fixed mid-screen header. While staging: `marked for update/installation/removal: pkg` (list rebuilds on unmark). Passive discovery may show `updates are available. Press u to mark all updates`. During **`u`**: `scanning n of m for updates`. After **Enter**: optional **sudo password** prompt (masked), then apply progress (`updated:`, `installed:`, `removed:`, failures). Other notes (fetch, cooldown) also appear here.
+- **Right pane (top)**: Detailed information about the currently selected package (above the selection row), including Updater, Installed, and Published when known. With **`?`**, help fills the entire right column (details + Recent Operations height).
+- **Recent Operations**: Fixed mid-screen header (hidden while help is open; restored when help is dismissed). While staging: `marked for update/installation/removal: pkg` (list rebuilds on unmark). Passive discovery may show `updates are available. Press u to mark all updates`. During **`u`**: `scanning n of m for updates`. After **Enter**: optional **sudo password** prompt (masked), then apply progress (`updated:`, `installed:`, `removed:`, failures). Other notes (fetch, cooldown) also appear here.
 - **Status bar**: Key hints only (changes during password entry or quit-with-pending prompt).
 
 ## How It Works
