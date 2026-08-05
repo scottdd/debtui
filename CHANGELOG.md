@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Surface initial deb-get failure in Recent Operations (not only on exit).
+- Close help during apply / update scan so sudo prompt and progress stay visible.
+- Keep pending marks for packages that fail install/remove/update (retry-friendly).
+- Free deb-get command output, package-name lists, and details-cache string fields.
+- Reset temp allocator each main-loop iteration; password mask uses a stack buffer.
+
 ## [0.3.1] - 2026-08-04
 
 ### Added

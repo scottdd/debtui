@@ -20,6 +20,7 @@ import "core:sys/posix"
 
 // Create a private, exclusive temp file path for deb-get output capture.
 // Avoids a fixed world-writable path under /tmp (race / hijack risk).
+// Mode is forced to 0600 after create.
 make_debget_temp_path :: proc() -> (path: string, ok: bool) {
     f, err := os.create_temp_file("", "debtui-*.out")
     if err != nil {
@@ -28,7 +29,45 @@ make_debget_temp_path :: proc() -> (path: string, ok: bool) {
     // Clone the path before close; the file stays on disk for the shell redirect.
     path = strings.clone(os.name(f))
     os.close(f)
+    _ = os.change_mode(path, os.perm_number(0o600))
     return path, true
+}
+
+// Own a copy of detail strings (empty stays empty; no free needed for "").
+clone_field :: proc(s: string, allocator := context.allocator) -> string {
+    if s == "" do return ""
+    return strings.clone(s, allocator)
+}
+
+// Deep-copy Package_Details so fields are independent of deb-get output buffers.
+// Does not copy `raw` (not persisted; avoids huge blobs in the details cache).
+clone_details :: proc(d: Package_Details, allocator := context.allocator) -> Package_Details {
+    return Package_Details{
+        title        = clone_field(d.title, allocator),
+        package_name = clone_field(d.package_name, allocator),
+        repository   = clone_field(d.repository, allocator),
+        updater      = clone_field(d.updater, allocator),
+        installed    = clone_field(d.installed, allocator),
+        published    = clone_field(d.published, allocator),
+        architecture = clone_field(d.architecture, allocator),
+        website      = clone_field(d.website, allocator),
+        summary      = clone_field(d.summary, allocator),
+        raw          = "",
+    }
+}
+
+// Free heap strings in a Package_Details (no-op on empty fields).
+free_details :: proc(d: Package_Details) {
+    if d.title != "" do delete(d.title)
+    if d.package_name != "" do delete(d.package_name)
+    if d.repository != "" do delete(d.repository)
+    if d.updater != "" do delete(d.updater)
+    if d.installed != "" do delete(d.installed)
+    if d.published != "" do delete(d.published)
+    if d.architecture != "" do delete(d.architecture)
+    if d.website != "" do delete(d.website)
+    if d.summary != "" do delete(d.summary)
+    if d.raw != "" do delete(d.raw)
 }
 
 // Shell-escape a path for single-quoted use in a system() command line.
@@ -110,7 +149,8 @@ sudo_cache_credentials :: proc(password: string) -> bool {
     return libc.system(ccmd) == 0
 }
 
-// Run a deb-get command and return (combined_output, success)
+// Run a deb-get command and return (combined_output, success).
+// Caller owns `output` and must `delete(output)` when non-empty.
 run_debget :: proc(args: ..string) -> (output: string, ok: bool) {
     if len(args) == 0 {
         return "", false
@@ -131,7 +171,7 @@ run_debget :: proc(args: ..string) -> (output: string, ok: bool) {
 
     tmpfile, tmp_ok := make_debget_temp_path()
     if !tmp_ok {
-        return "(failed to create private temp file for deb-get output)", false
+        return strings.clone("(failed to create private temp file for deb-get output)"), false
     }
     defer {
         os.remove(tmpfile)
@@ -143,12 +183,12 @@ run_debget :: proc(args: ..string) -> (output: string, ok: bool) {
     ccmd := strings.clone_to_cstring(full_cmd, context.temp_allocator)
     ret := libc.system(ccmd)
 
-    // Read the temp file (best effort)
+    // Read the temp file (best effort); ownership of `data` transfers to caller as `output`
     data, read_err := os.read_entire_file_from_path(tmpfile, context.allocator)
     if read_err == nil {
         output = string(data)
     } else {
-        output = fmt.tprintf("(failed to read command output from %s)", tmpfile)
+        output = strings.clone(fmt.tprintf("(failed to read command output from %s)", tmpfile))
     }
 
     // libc.system returns the raw status (shifted). 0 usually means success.
@@ -156,44 +196,45 @@ run_debget :: proc(args: ..string) -> (output: string, ok: bool) {
     return output, ok
 }
 
-// Get full list of available packages (fast, --raw)
+// Parse package name lines from deb-get list output into owned strings.
+// Frees `out` and the split lines buffer.
+parse_package_list_output :: proc(out: string) -> []string {
+    if out == "" {
+        return nil
+    }
+    defer delete(out)
+
+    lines := strings.split_lines(out)
+    defer delete(lines)
+
+    pkgs := make([dynamic]string, 0, len(lines))
+    for line in lines {
+        trimmed := strings.trim_space(line)
+        if trimmed != "" {
+            append(&pkgs, strings.clone(trimmed))
+        }
+    }
+    return pkgs[:]
+}
+
+// Get full list of available packages (fast, --raw). Caller owns the slice and each name.
 get_available_packages :: proc() -> ([]string, bool) {
     out, ok := run_debget("list", "--raw")
     if !ok {
+        if out != "" do delete(out)
         return nil, false
     }
-
-    lines := strings.split_lines(out)
-    pkgs := make([dynamic]string, 0, len(lines))
-
-    for line in lines {
-        trimmed := strings.trim_space(line)
-        if trimmed != "" {
-            append(&pkgs, trimmed)
-        }
-    }
-
-    return pkgs[:], true
+    return parse_package_list_output(out), true
 }
 
-// Get list of installed packages via deb-get
+// Get list of installed packages via deb-get. Caller owns the slice and each name.
 get_installed_packages :: proc() -> ([]string, bool) {
     out, ok := run_debget("list", "--installed")
     if !ok {
+        if out != "" do delete(out)
         return nil, false
     }
-
-    lines := strings.split_lines(out)
-    pkgs := make([dynamic]string, 0, len(lines))
-
-    for line in lines {
-        trimmed := strings.trim_space(line)
-        if trimmed != "" {
-            append(&pkgs, trimmed)
-        }
-    }
-
-    return pkgs[:], true
+    return parse_package_list_output(out), true
 }
 
 // Package details parsed from `deb-get show`
@@ -260,6 +301,7 @@ parse_details :: proc(raw: string) -> Package_Details {
     d := Package_Details{raw = raw}
 
     lines := strings.split_lines(raw)
+    defer delete(lines)
 
     for i := 0; i < len(lines); i += 1 {
         line := strings.trim_right_space(lines[i])
@@ -287,6 +329,7 @@ parse_details_list :: proc(raw: string) -> [dynamic]Package_Details {
     has_block := false
 
     lines := strings.split_lines(raw)
+    defer delete(lines)
     for line in lines {
         trimmed := strings.trim_right_space(line)
         if trimmed == "" do continue
@@ -320,6 +363,7 @@ parse_details_list :: proc(raw: string) -> [dynamic]Package_Details {
 }
 
 // Run `deb-get show` for one or more packages, parse, write disk cache, return parsed list.
+// Each returned Package_Details owns its string fields (caller free_details each).
 // On total failure returns empty list.
 fetch_package_details_batch :: proc(pkgs: []string) -> [dynamic]Package_Details {
     results := make([dynamic]Package_Details)
@@ -335,19 +379,23 @@ fetch_package_details_batch :: proc(pkgs: []string) -> [dynamic]Package_Details 
     }
 
     out, ok := run_debget(..args)
-    // Keep `out` alive: parsed field strings slice into it (same pattern as get_package_details).
-    if (!ok && out == "") || out == "" {
+    if out == "" {
         return results
     }
+    defer delete(out)
+    _ = ok
 
     if len(pkgs) == 1 {
         details := parse_details(out)
-        if details.package_name == "" {
-            details.package_name = pkgs[0]
+        owned := clone_details(details)
+        if owned.package_name == "" {
+            owned.package_name = strings.clone(pkgs[0])
         }
-        if is_details_sane(details) {
-            save_details_to_cache(details.package_name, details)
-            append(&results, details)
+        if is_details_sane(owned) {
+            save_details_to_cache(owned.package_name, owned)
+            append(&results, owned)
+        } else {
+            free_details(owned)
         }
         return results
     }
@@ -355,18 +403,19 @@ fetch_package_details_batch :: proc(pkgs: []string) -> [dynamic]Package_Details 
     list := parse_details_list(out)
     defer delete(list)
 
-    by_name := make(map[string]Package_Details)
+    by_name := make(map[string]bool)
     defer delete(by_name)
     for d in list {
         if d.package_name == "" || !is_details_sane(d) do continue
-        save_details_to_cache(d.package_name, d)
-        by_name[d.package_name] = d
-        append(&results, d)
+        owned := clone_details(d)
+        save_details_to_cache(owned.package_name, owned)
+        by_name[owned.package_name] = true
+        append(&results, owned)
     }
 
     // Fall back to single-package show for any names missing from multi parse.
     for pkg in pkgs {
-        if _, found := by_name[pkg]; found do continue
+        if by_name[pkg] do continue
         if details, ok2 := get_package_details(pkg); ok2 {
             append(&results, details)
         }
@@ -376,11 +425,12 @@ fetch_package_details_batch :: proc(pkgs: []string) -> [dynamic]Package_Details 
 }
 
 // Execute install for a list of packages.
-// Returns (success, combined_output)
+// Returns (success, combined_output). Caller must delete(output) when non-empty.
 perform_install :: proc(pkgs: []string) -> (ok: bool, output: string) {
     if len(pkgs) == 0 do return true, ""
 
     args := make([]string, len(pkgs) + 1)
+    defer delete(args)
     args[0] = "install"
     copy(args[1:], pkgs)
 
@@ -389,10 +439,12 @@ perform_install :: proc(pkgs: []string) -> (ok: bool, output: string) {
 }
 
 // Execute remove for a list of packages.
+// Returns (success, combined_output). Caller must delete(output) when non-empty.
 perform_remove :: proc(pkgs: []string) -> (ok: bool, output: string) {
     if len(pkgs) == 0 do return true, ""
 
     args := make([]string, len(pkgs) + 1)
+    defer delete(args)
     args[0] = "remove"
     copy(args[1:], pkgs)
 
@@ -502,18 +554,21 @@ load_details_from_cache :: proc(pkg: string) -> (Package_Details, bool) {
 
     if !is_details_sane(cached.details) {
         log_cache_error("sanity check failed after unmarshal", path)
+        free_details(cached.details)
         return {}, false
     }
 
     now := time.to_unix_seconds(time.now())
     if now - cached.cached_at > CACHE_TTL_SECONDS {
         log_cache_error("stale cache entry (7-day TTL)", path)
+        free_details(cached.details)
         return {}, false
     }
 
     // Basic sanity: the package name in the file should match what we asked for
     if cached.details.package_name != "" && cached.details.package_name != pkg {
         log_cache_error("package_name mismatch in cache file", path)
+        free_details(cached.details)
         return {}, false
     }
 
@@ -579,15 +634,22 @@ get_package_details :: proc(pkg: string) -> (Package_Details, bool) {
     // Fetch fresh
     out, ok := run_debget("show", pkg)
     if (!ok) || (out == "") {
-        return Package_Details{package_name = pkg, raw = out}, false
+        if out != "" do delete(out)
+        return Package_Details{package_name = strings.clone(pkg)}, false
     }
 
     details := parse_details(out)
+    owned := clone_details(details)
+    delete(out)
+
+    if owned.package_name == "" {
+        owned.package_name = strings.clone(pkg)
+    }
 
     // Save to persistent cache
-    save_details_to_cache(pkg, details)
+    save_details_to_cache(pkg, owned)
 
-    return details, true
+    return owned, true
 }
 
 // cleanup_persistent_cache removes old cache entries (>7 days) and entries for
@@ -815,14 +877,17 @@ load_cached_details_meta :: proc(pkg: string) -> (details: Package_Details, cach
     }
     cached.details.raw = ""
     if !is_details_sane(cached.details) {
+        free_details(cached.details)
         return {}, 0, false
     }
     if cached.details.package_name != "" && cached.details.package_name != pkg {
+        free_details(cached.details)
         return {}, 0, false
     }
 
     now := time.to_unix_seconds(time.now())
     if now - cached.cached_at > CACHE_TTL_SECONDS {
+        free_details(cached.details)
         return {}, 0, false
     }
     return cached.details, cached.cached_at, true
