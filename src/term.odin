@@ -10,6 +10,7 @@ import "core:sys/posix"
 import "core:c"
 import "core:c/libc"
 import "core:time"
+import "core:unicode/utf8"
 
 foreign import libc_sys "system:c"
 
@@ -284,7 +285,7 @@ read_key :: proc() -> Key {
     // Enter / Return (handle early because \r is < 32)
     if (b == '\r') || (b == '\n') do return Special_Key.Enter
 
-    // Normal printable
+    // Normal ASCII printable
     if (b >= 32) && (b < 127) {
         if b == '\t' do return Special_Key.Tab
         return rune(b)
@@ -293,6 +294,39 @@ read_key :: proc() -> Key {
     // Backspace
     if (b == 127) || (b == 8) {
         return Special_Key.Backspace
+    }
+
+    // UTF-8 multi-byte character (leading byte 0xC2–0xF4)
+    if b >= 0xC2 && b <= 0xF4 {
+        expect := 2
+        if b >= 0xF0 {
+            expect = 4
+        } else if b >= 0xE0 {
+            expect = 3
+        }
+        seq: [4]byte
+        seq[0] = b
+        have := 1
+        // Use any extra bytes already in this read
+        for have < expect && have < n {
+            seq[have] = buf[have]
+            have += 1
+        }
+        // Read remaining continuation bytes
+        for have < expect {
+            more, merr := os.read(os.stdin, seq[have:have+1])
+            if merr != nil || more <= 0 {
+                break
+            }
+            have += more
+        }
+        if have == expect {
+            r, size := utf8.decode_rune(seq[:have])
+            if size > 0 && r != utf8.RUNE_ERROR {
+                return r
+            }
+        }
+        return Unknown_Escape{}
     }
 
     // Escape or escape sequence

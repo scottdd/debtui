@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Free deb-get command output, package-name lists, and details-cache string fields.
 - Reset temp allocator each main-loop iteration; password mask uses a stack buffer.
 
+### Changed
+
+- UTF-8 throughout: multi-byte keyboard input, rune-aware wrap/truncate for details and RO,
+  and Unicode passwords (mask counts runes, backspace deletes one scalar).
+
 ## [0.3.1] - 2026-08-04
 
 ### Added
