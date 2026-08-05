@@ -224,6 +224,15 @@ set_bg :: proc(c: BgColor) {
     fmt.printf("%s%dm", CSI, u8(c))
 }
 
+// SGR text attributes (combine with set_fg / set_bg; clear with reset_attrs)
+set_bold :: proc() {
+    fmt.print(CSI, "1m")
+}
+
+set_underline :: proc() {
+    fmt.print(CSI, "4m")
+}
+
 reset_attrs :: proc() {
     fmt.print(CSI, "0m")
 }

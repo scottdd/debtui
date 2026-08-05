@@ -605,10 +605,11 @@ draw :: proc(app: ^App) {
     set_fg(BASE_FG)
 
     // ---------------- Header ----------------
-    set_fg(COLOR_TITLE)
     move_cursor(1,header_y)
     write(strings.repeat(" ", left_width+right_width))
     move_cursor(2,header_y)
+    set_bold()
+    set_fg(COLOR_TITLE)
     write("debtui")
     reset_attrs()
 
@@ -621,6 +622,7 @@ draw :: proc(app: ^App) {
     move_cursor(left_x, list_start_y - 1)
     write(strings.repeat(" ", left_width))
     move_cursor(left_x, list_start_y - 1)
+    set_underline()
     set_fg(COLOR_HEADER)
     write("Available packages")
     if len(app.available) > 0 {
@@ -632,6 +634,7 @@ draw :: proc(app: ^App) {
     move_cursor(right_x, list_start_y - 1)
     write(strings.repeat(" ", right_width))
     move_cursor(right_x, list_start_y - 1)
+    set_underline()
     set_fg(COLOR_HEADER)
     if app.show_help {
         write("Help")
@@ -887,11 +890,15 @@ draw :: proc(app: ^App) {
         // Header stays at fixed mid-screen row
         move_cursor(right_x, status_region_y)
         set_bg(DETAIL_BG)
+        set_underline()
         set_fg(COLOR_HEADER)
         header := "Recent Operations"
         write(header)
         hcols := display_cols(header)
         if hcols < right_width {
+            // Padding without underline so the rule doesn't span the whole pane
+            reset_attrs()
+            set_bg(DETAIL_BG)
             write(strings.repeat(" ", right_width - hcols))
         }
         reset_attrs()
