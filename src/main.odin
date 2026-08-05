@@ -34,17 +34,21 @@ draw_frame_arena: mem.Arena
 // Layout (two panes):
 //   +---------------------------+--------------------------------+
 //   | LEFT: Available packages  | RIGHT: Package details         |
-//   | (scrollable list)         | (upper half)                   |
+//   | (scrollable list)         | (upper half: fields / Help)    |
 //   |                           | Recent Operations (mid-screen) |
 //   |                           | operation log (below)          |
 //   +---------------------------+--------------------------------+
 //   | Status bar: key hints                                      |
 //   +------------------------------------------------------------+
 //
-// All marking and navigation happens in the single left list.
-// Space = toggle mark (install if free; installed: clear update → remove → clear).
-// u = scan installed (cache ≥24h) for updates and mark them.
-// Details always reflect the left list selection (or Help when show_help).
+// Marking (left list only):
+//   Space — not installed: toggle install mark;
+//           installed: clear update → mark remove → clear remove.
+//   u     — scan installed packages (cache missing/≥24h), mark known updates.
+//   c     — clear all marks; re-hint if session still knows about updates.
+//   Enter — apply pending installs/updates then removes (sudo via RO if needed).
+//   Esc   — cancel remaining work during a long update scan (partial marks kept).
+// Details pane follows left selection (or Help when show_help).
 // ============================================================================
 
 // Minimum seconds between user-initiated list fetches (f). Startup counts as a fetch.
@@ -83,7 +87,7 @@ App :: struct {
     left_selection:  int,
     left_scroll:     int,
 
-    // Details cache (package name -> details string or struct)
+    // In-memory package details (name → Package_Details); disk cache is separate
     details_cache: map[string]Package_Details,
 
     // Current rendered details for left selection
@@ -651,6 +655,7 @@ draw :: proc(app: ^App) {
         // Key fields - wrap long values so nothing is chopped off
         fields := [?][2]string{
             {"Package",     det.package_name},
+            {"Updater",     det.updater},
             {"Installed",   det.installed},
             {"Published",   det.published},
             {"Website",     det.website},
@@ -1260,9 +1265,10 @@ draw_help_pane :: proc(x, y, width, height: int) {
         "debtui — TUI front-end for deb-get",
         "",
         "Browse packages in the left list. Space toggles",
-        "marks. Installed: clear update → remove → clear.",
-        "u scans installed packages for updates and marks",
-        "them. Enter applies all marks.",
+        "marks (press again to unmark). Installed:",
+        "clear update → remove → clear. u scans installed",
+        "packages for updates and marks them. Enter applies.",
+        "Quit with pending marks asks to apply first.",
         "",
         "Keys:",
         "  ↑↓ / j k     Move selection",
@@ -1271,6 +1277,7 @@ draw_help_pane :: proc(x, y, width, height: int) {
         "  Space        Toggle mark",
         "  Enter        Apply all marks",
         "  u            Mark all updates (scan)",
+        "  Esc          Cancel update scan (keep marks)",
         "  c            Clear all marks",
         "  f            Fetch list (rate limited)",
         "  ?            Toggle this help",
@@ -1792,14 +1799,6 @@ handle_key :: proc(app: ^App, key: Key) -> bool {
     return app.running
 }
 
-// After apply_pending we show the command output in a simple "press any key" screen
-// (kept for now but no longer triggered; output now lives in the Recent Operations pane)
-show_process_result :: proc(app: ^App) {
-    // The status pane in the right column replaces this full-screen result view.
-    app.last_error = ""
-    app.needs_redraw = true
-}
-
 // Print a short session summary on the primary screen after terminal restore.
 // Plain text only — no ANSI colors (uses the user's default terminal colors).
 print_exit_summary :: proc(app: ^App) {
@@ -1809,7 +1808,7 @@ print_exit_summary :: proc(app: ^App) {
 
     n_pending := len(app.pending_install) + len(app.pending_remove)
     if n_pending > 0 {
-        fmt.printf("  pending (not applied): %d install, %d remove\n",
+        fmt.printf("  pending (not applied): %d install/update, %d remove\n",
             len(app.pending_install), len(app.pending_remove))
     }
 

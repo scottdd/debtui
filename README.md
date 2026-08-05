@@ -6,12 +6,14 @@ A terminal user interface (TUI) front-end for [deb-get](https://github.com/wimpy
 
 - Browse all packages available through deb-get in a single scrollable list (left pane)
 - View detailed information for the currently selected package (right pane)
-- Toggle install/remove/update marks with `Space` (context-aware)
+- Toggle install/remove/update marks with `Space` (context-aware; press again to unmark)
 - Scan installed packages for updates with `u` and mark them for upgrade
+- Passive notice in Recent Operations when an update is discovered while loading details
 - Apply all marked operations at once with `Enter` (installs, updates, removes)
 - Clear all marks with `c`; re-fetch package lists with `f` (rate limited)
 - **Recent Operations** pane (fixed mid-screen header) shows staging and apply results
 - In-app help (`?`) in the package-details pane
+- Quit with pending marks prompts to apply them first (timeout defaults to leave pending)
 
 ## Background
 
@@ -22,6 +24,7 @@ This application is clanker code. I am learning Odin, and plan to build a fleet 
 - **Linux** (termios / ANSI alternate screen)
 - [Odin compiler](https://odin-lang.org/docs/install/)
 - [deb-get](https://github.com/wimpysworld/deb-get) installed and available in `$PATH`
+- **`dpkg`** (for version compares when detecting package updates; standard on Debian/Ubuntu)
 - A modern terminal that supports ANSI escape codes and the alternate screen buffer
 
 ## Build & Run
@@ -72,9 +75,10 @@ Example:
 ### Marking & Actions
 | Key     | Action                                           |
 |---------|--------------------------------------------------|
-| `Space` | **Toggle mark** — not installed: install; installed: clear update → remove → clear |
+| `Space` | **Toggle mark** — not installed: install (press again to unmark); installed: clear update → remove → clear |
 | `Enter` | Apply all marked install, update, and remove operations |
 | `u`     | Scan installed packages for updates and mark them |
+| `Esc`   | During an update scan: cancel remaining fetches (partial marks kept) |
 | `c`     | Clear all pending marks                          |
 
 ### Other
@@ -82,7 +86,7 @@ Example:
 |-----------|------------------------------------------|
 | `f`       | Fetch package lists from deb-get (rate limited: 30s cooldown) |
 | `?`       | Toggle help in the package-details pane  |
-| `q` / `Q` | Quit                                     |
+| `q` / `Q` | Quit (if marks are pending, prompt to apply first) |
 | `Ctrl+C`  | Quit (same as `q`)                       |
 | `Ctrl+R`  | Same as `f` (fetch, rate limited)        |
 
@@ -93,9 +97,9 @@ Example:
   - `[↑]` = marked for update (upgrade)
   - `[+]` = marked for installation
   - `[-]` = marked for uninstallation
-- **Right pane (top)**: Detailed information about the currently selected package (above the selection row), including Installed / Published when known.
+- **Right pane (top)**: Detailed information about the currently selected package (above the selection row), including Updater, Installed, and Published when known.
 - **Recent Operations**: Fixed mid-screen header. While staging: `marked for update/installation/removal: pkg` (list rebuilds on unmark). Passive discovery may show `updates are available. Press u to mark all updates`. During **`u`**: `scanning n of m for updates`. After **Enter**: optional **sudo password** prompt (masked), then apply progress (`updated:`, `installed:`, `removed:`, failures). Other notes (fetch, cooldown) also appear here.
-- **Status bar**: Key hints only (changes during password entry).
+- **Status bar**: Key hints only (changes during password entry or quit-with-pending prompt).
 
 ## How It Works
 
@@ -106,7 +110,7 @@ Example:
 - `deb-get show <pkg list>` — fetches details for the right pane (cached locally for 7 days)
 - On **Enter**: runs `deb-get install ...` (new installs and upgrades) and/or `deb-get remove ...` for all marked packages
 
-After the package list loads (startup or **f**), `debtui` rehydrates fresh disk-cache entries into memory, then fetches at most **5** missing/expired detail entries via `deb-get show` (so startup stays responsive). When you move to a package that still has no details, it fetches that package plus up to four more gaps further down the list. If more than four packages are fetched in one burst, Recent Operations briefly shows `loading details: n/m`.
+After the package list loads (startup or **f**), `debtui` rehydrates fresh disk-cache entries into memory, then fetches at most **5** missing/expired detail entries via `deb-get show` (so startup stays responsive). Gaps load over time: when you focus a package that still needs details, it fetches that package plus up to four more gaps further down the list. If more than four packages are fetched in one burst, Recent Operations briefly shows `loading details: n/m`.
 
 ### Updates
 
@@ -119,7 +123,7 @@ After the package list loads (startup or **f**), `debtui` rehydrates fresh disk-
 
 Package details are cached on disk to avoid repeated network requests. See the **Persistent Cache** section for details.
 
-All package operations are performed only when you explicitly press `Enter`.
+All package operations are performed only when you explicitly press `Enter` (or confirm apply when quitting with pending marks).
 
 ## Persistent Cache
 
@@ -128,13 +132,13 @@ All package operations are performed only when you explicitly press `Enter`.
 - **Location**: `~/.cache/debtui/` (or `$XDG_CACHE_HOME/debtui` if set)
 - **TTL**: Package details are considered fresh for **7 days** during normal browse/preload.
 - **Update scan (`u`)**: Uses a **24-hour** threshold for installed packages only; successful fetches refresh the same cache files (`cached_at`).
-- **Startup / fetch preload**: After listing packages, fresh cache files are loaded into memory; at most 5 missing/expired entries are fetched over the network. Further gaps load on demand (5 at a time) when you focus a package that still needs details.
+- **Startup / fetch preload**: After listing packages, fresh cache files are loaded into memory; at most 5 missing/expired entries are fetched over the network. Further gaps load over time (on focus, 5 at a time) or when you run **`u`** for installed packages.
 - **Automatic cleanup**: On startup and every list fetch (`f`), the app removes:
   - Entries older than 7 days
   - Entries for packages that no longer appear in `deb-get list --raw`
 - **Diagnostic logs**: If cache-related errors occur, they are written to daily files named `cache-errors-YYYY-MM-DD.log` inside the cache directory. These files are only created when something noteworthy happens.
 
-This caching makes browsing large lists of packages much faster after the first run (and after a one-time preload of any gaps).
+This caching makes browsing large lists of packages much faster after the first run as gaps load over time / on focus / via `u`.
 
 ## License
 
@@ -149,3 +153,5 @@ This project is released into the public domain under the [Unlicense](LICENSE).
 ## Contributing
 
 Bug reports and pull requests are welcome. Please try to keep the interface simple and keyboard-driven.
+
+See [CHANGELOG.md](CHANGELOG.md) for version history.
