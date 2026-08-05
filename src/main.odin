@@ -14,7 +14,7 @@ import "core:unicode/utf8"
 // Set while the RO panel is collecting a sudo password (status bar hint changes).
 password_entry_active := false
 
-DEBTUI_VERSION :: "0.3.1"
+DEBTUI_VERSION :: "0.3.2"
 
 // Global verbose flag controlled by --verbose / -v.
 // When false, we suppress the detailed diagnostic logging that was added

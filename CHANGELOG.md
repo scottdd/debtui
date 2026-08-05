@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-08-05
+
 ### Fixed
 
 - Surface initial deb-get failure in Recent Operations (not only on exit).
@@ -19,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - UTF-8 throughout: multi-byte keyboard input, rune-aware wrap/truncate for details and RO,
   and Unicode passwords (mask counts runes, backspace deletes one scalar).
+- Panel headers underlined; app title **debtui** is bold.
+- Version **0.3.2**.
 
 ## [0.3.1] - 2026-08-04
 
@@ -78,6 +82,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Basic keyboard navigation and marking workflow (evolved through early commits).
 
 [Unreleased]: https://github.com/scottdd/debtui/compare/main...HEAD
+[0.3.2]: https://github.com/scottdd/debtui/commits/main
 [0.3.1]: https://github.com/scottdd/debtui/commits/main
 [0.3.0]: https://github.com/scottdd/debtui/commits/main
 [0.2.0]: https://github.com/scottdd/debtui/commits/main
