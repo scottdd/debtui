@@ -376,23 +376,35 @@ maybe_show_updates_hint :: proc(app: ^App) {
 }
 
 // Store batch results in details_cache (keys from available[] / need list).
+// `fetched` entries that are stored transfer ownership into the cache.
 apply_fetched_details :: proc(app: ^App, need: []string, fetched: []Package_Details) {
+    used := make(map[int]bool)
+    defer delete(used)
+
     for pkg in need {
         if _, already := app.details_cache[pkg]; already do continue
         found := false
-        for d in fetched {
+        for d, di in fetched {
+            if used[di] do continue
             if d.package_name == pkg {
-                app.details_cache[pkg] = d
+                put_details_cache(&app.details_cache, pkg, d)
                 note_package_update_status(app, pkg, d)
+                used[di] = true
                 found = true
                 break
             }
         }
         if !found {
-            app.details_cache[pkg] = Package_Details{
-                package_name = pkg,
-                raw = "Failed to fetch details from deb-get",
-            }
+            put_details_cache(&app.details_cache, pkg, Package_Details{
+                package_name = strings.clone(pkg),
+                summary      = strings.clone("Failed to fetch details from deb-get"),
+            })
+        }
+    }
+    // Free any fetched entries not stored (name mismatch leftovers)
+    for d, di in fetched {
+        if !used[di] {
+            free_details(d)
         }
     }
 }
@@ -406,11 +418,11 @@ fetch_details_chunk :: proc(app: ^App, need: []string) {
         append_status_line(app, fmt.tprintf("loading details: 0/%d", len(need)))
         for pkg in need {
             if _, ok := app.details_cache[pkg]; !ok {
-                app.details_cache[pkg] = Package_Details{
-                    package_name = pkg,
-                    title        = pkg,
-                    summary      = "Loading package details…",
-                }
+                put_details_cache(&app.details_cache, pkg, Package_Details{
+                    package_name = strings.clone(pkg),
+                    title        = strings.clone(pkg),
+                    summary      = strings.clone("Loading package details…"),
+                })
             }
         }
         app.skip_details_ensure = true
@@ -418,6 +430,7 @@ fetch_details_chunk :: proc(app: ^App, need: []string) {
         app.skip_details_ensure = false
         for pkg in need {
             if d, ok := app.details_cache[pkg]; ok && d.summary == "Loading package details…" {
+                free_details(d)
                 delete_key(&app.details_cache, pkg)
             }
         }
@@ -456,7 +469,7 @@ collect_details_to_fetch :: proc(app: ^App, start_idx: int, limit: int) -> [dyna
         pkg := app.available[(start + offset) % n]
         if _, ok := app.details_cache[pkg]; ok do continue
         if details, ok := load_details_from_cache(pkg); ok {
-            app.details_cache[pkg] = details
+            put_details_cache(&app.details_cache, pkg, details)
             note_package_update_status(app, pkg, details)
             continue
         }
@@ -481,7 +494,7 @@ ensure_selection_details :: proc(app: ^App) {
     }
     // Try disk first (cheap); only burst-fetch when the focused package needs network.
     if details, ok := load_details_from_cache(sel_pkg); ok {
-        app.details_cache[sel_pkg] = details
+        put_details_cache(&app.details_cache, sel_pkg, details)
         note_package_update_status(app, sel_pkg, details)
         return
     }
@@ -965,7 +978,33 @@ init_app :: proc() -> App {
     return app
 }
 
+// Free all Package_Details values in the map, then clear the map.
+clear_details_cache :: proc(cache: ^map[string]Package_Details) {
+    for _, d in cache {
+        free_details(d)
+    }
+    clear(cache)
+}
+
+// Replace a cache entry, freeing any previous value for the same key.
+put_details_cache :: proc(cache: ^map[string]Package_Details, pkg: string, details: Package_Details) {
+    if old, ok := cache[pkg]; ok {
+        free_details(old)
+    }
+    cache[pkg] = details
+}
+
+// Free a slice of owned package-name strings (from get_*_packages).
+free_string_list :: proc(list: []string) {
+    if list == nil do return
+    for s in list {
+        if s != "" do delete(s)
+    }
+    delete(list)
+}
+
 destroy_app :: proc(app: ^App) {
+    clear_details_cache(&app.details_cache)
     delete(app.details_cache)
     delete(app.installed_set)
     delete(app.pending_install)
@@ -975,8 +1014,8 @@ destroy_app :: proc(app: ^App) {
         delete(line)
     }
     delete(app.status_lines)
-    if app.available != nil do delete(app.available)
-    if app.installed != nil do delete(app.installed)
+    free_string_list(app.available)
+    free_string_list(app.installed)
     if draw_frame_backing != nil {
         delete(draw_frame_backing)
         draw_frame_backing = nil
@@ -995,9 +1034,9 @@ refresh_data :: proc(app: ^App) -> bool {
         return false
     }
 
-    // Replace data
-    if app.available != nil do delete(app.available)
-    if app.installed != nil do delete(app.installed)
+    // Replace data (owned name lists)
+    free_string_list(app.available)
+    free_string_list(app.installed)
 
     app.available = avail
     app.installed = inst
@@ -1008,9 +1047,8 @@ refresh_data :: proc(app: ^App) -> bool {
         app.installed_set[p] = true
     }
 
-    // In-memory details keys pointed at the previous available[] strings; drop them.
-    // Disk cache is the durable source of truth and is rehydrated by preload.
-    clear(&app.details_cache)
+    // In-memory details held owned field strings; free them. Disk cache is durable.
+    clear_details_cache(&app.details_cache)
 
     // Drop update flags for packages no longer installed
     to_drop := make([dynamic]string, 0, len(app.update_available))
@@ -1048,7 +1086,7 @@ preload_missing_details :: proc(app: ^App) {
     for pkg in app.available {
         if _, ok := app.details_cache[pkg]; ok do continue
         if details, ok := load_details_from_cache(pkg); ok {
-            app.details_cache[pkg] = details
+            put_details_cache(&app.details_cache, pkg, details)
             note_package_update_status(app, pkg, details)
         }
     }
@@ -1132,6 +1170,8 @@ poll_cancel_key :: proc() -> bool {
 // `u`: refresh installed packages with missing/≥24h cache, then mark all known updates.
 // Progress in RO; Esc cancels remaining fetches but keeps marks already applied.
 mark_all_updates :: proc(app: ^App) {
+    app.show_help = false // RO must be visible for progress / cancel feedback
+
     if len(app.installed) == 0 {
         clear_status_lines(app)
         append_status_line(app, "no updates to mark")
@@ -1145,7 +1185,7 @@ mark_all_updates :: proc(app: ^App) {
         if details, cached_at, ok := load_cached_details_meta(pkg); ok {
             now := time.to_unix_seconds(time.now())
             if now - cached_at < UPDATE_SCAN_MAX_AGE_SECONDS {
-                app.details_cache[pkg] = details
+                put_details_cache(&app.details_cache, pkg, details)
                 note_package_update_status(app, pkg, details)
             }
         }
@@ -1160,7 +1200,7 @@ mark_all_updates :: proc(app: ^App) {
         } else if det, ok := app.details_cache[pkg]; ok {
             note_package_update_status(app, pkg, det)
         } else if details, _, ok2 := load_cached_details_meta(pkg); ok2 {
-            app.details_cache[pkg] = details
+            put_details_cache(&app.details_cache, pkg, details)
             note_package_update_status(app, pkg, details)
         }
     }
@@ -1183,12 +1223,16 @@ mark_all_updates :: proc(app: ^App) {
 
             // Drop any in-memory entry so apply_fetched_details will store fresh results
             for pkg in batch {
-                delete_key(&app.details_cache, pkg)
+                if old, ok := app.details_cache[pkg]; ok {
+                    free_details(old)
+                    delete_key(&app.details_cache, pkg)
+                }
             }
 
             fetched := fetch_package_details_batch(batch)
             apply_fetched_details(app, batch, fetched[:])
             delete(fetched)
+            free_all(context.temp_allocator)
 
             done = end
             replace_last_status_line(app, fmt.tprintf("scanning %d of %d for updates", done, len(to_scan)))
@@ -1358,13 +1402,17 @@ draw_help_pane :: proc(x, y, width, height: int) {
 
 // Process all pending operations
 apply_pending :: proc(app: ^App) {
+    app.show_help = false // RO must be visible for sudo prompt and progress
+
     // Collect lists (copy because we clear as we go)
     to_install := make([dynamic]string, 0, len(app.pending_install))
+    defer delete(to_install)
     for p in app.pending_install {
         append(&to_install, p)
     }
 
     to_remove := make([dynamic]string, 0, len(app.pending_remove))
+    defer delete(to_remove)
     for p in app.pending_remove {
         append(&to_remove, p)
     }
@@ -1404,12 +1452,14 @@ apply_pending :: proc(app: ^App) {
     }
 
     // Process one package at a time so we can report per-app status in the pane.
-    // Installs first, then removes.
+    // Installs first, then removes. Only clear marks for packages that succeed.
 
     for p in to_install {
         was_installed := app.installed_set[p]
-        ok, _ := perform_install([]string{p})
+        ok, out := perform_install([]string{p})
+        if out != "" do delete(out)
         if ok {
+            delete_key(&app.pending_install, p)
             if was_installed {
                 append_status_line(app, fmt.tprintf("updated: %s", p))
                 delete_key(&app.update_available, p)
@@ -1423,27 +1473,29 @@ apply_pending :: proc(app: ^App) {
                 append_status_line(app, fmt.tprintf("failed to install: %s", p))
             }
         }
+        free_all(context.temp_allocator)
         app.needs_redraw = true
         draw(app)  // live update in Recent Operations
     }
 
     for p in to_remove {
-        ok, _ := perform_remove([]string{p})
+        ok, out := perform_remove([]string{p})
+        if out != "" do delete(out)
         if ok {
+            delete_key(&app.pending_remove, p)
             append_status_line(app, fmt.tprintf("removed: %s", p))
         } else {
             append_status_line(app, fmt.tprintf("failed to remove: %s", p))
         }
+        free_all(context.temp_allocator)
         app.needs_redraw = true
         draw(app)
     }
 
     // Final refresh so left list and installed markers update
     refresh_data(app)
-
-    clear(&app.pending_install)
-    clear(&app.pending_remove)
-
+    // Pending maps still hold failures so the user can retry Enter
+    free_all(context.temp_allocator)
     app.needs_redraw = true
 }
 
@@ -1521,12 +1573,15 @@ read_password_in_ro :: proc(app: ^App) -> (password: string, ok: bool) {
             // ignore
         }
 
-        // Update mask row: only asterisks, never the real password
+        // Update mask row: only asterisks, never the real password (stack buffer, no leak)
         if n == 0 {
             replace_last_status_line(app, "")
         } else {
-            mask := strings.repeat("*", n)
-            replace_last_status_line(app, mask)
+            mask_buf: [512]byte
+            for i in 0..<n {
+                mask_buf[i] = '*'
+            }
+            replace_last_status_line(app, string(mask_buf[:n]))
         }
         draw(app)
     }
@@ -1883,8 +1938,10 @@ main :: proc() {
         // Fill in-memory + disk cache for any missing/expired package details.
         // Shows "loading details: n/m" in Recent Operations when many are needed.
         preload_missing_details(&app)
+    } else if app.last_error != "" {
+        // Surface startup failure in Recent Operations (not only exit summary)
+        append_status_line(&app, app.last_error)
     }
-    // Still continue on failure — user will see error in status
     if verbose {
         log_cache_error(fmt.tprintf("main: refresh_data completed, available=%d packages, initial_selection=%d", len(app.available), app.left_selection))
         if len(app.available) > 0 {
@@ -1901,7 +1958,7 @@ main :: proc() {
     }
 
     // Simple main loop. We redraw only when needed.
-    // For better responsiveness we could also redraw on timer for clock etc., but not necessary.
+    // free_all temp allocator each iteration — shell_quote / tprintf use it heavily.
     for app.running {
         // Handle terminal resize if SIGWINCH fired
         if handle_pending_resize() {
@@ -1917,6 +1974,7 @@ main :: proc() {
                 draw(&app)
                 app.needs_redraw = false
             }
+            free_all(context.temp_allocator)
             sleep_ms(16)   // ~60 fps cap when active
             continue
         }
@@ -1928,6 +1986,8 @@ main :: proc() {
             draw(&app)
             app.needs_redraw = false
         }
+
+        free_all(context.temp_allocator)
 
         if !still_running {
             break
