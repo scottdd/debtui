@@ -273,8 +273,43 @@ draw_list_item :: proc(x, y, width: int, text: string, is_selected: bool, is_ins
     reset_attrs()
 }
 
+// Display width in terminal columns ≈ Unicode scalar count (BMP-friendly).
+// Full East-Asian width is not implemented; still correct for multi-byte UTF-8.
+display_cols :: proc(s: string) -> int {
+    return utf8.rune_count_in_string(s)
+}
+
+// Byte length of the first `max_cols` runes of s (or whole string if shorter).
+byte_len_for_cols :: proc(s: string, max_cols: int) -> int {
+    if max_cols <= 0 do return 0
+    end := 0
+    count := 0
+    for r in s {
+        if count >= max_cols do break
+        end += utf8.rune_size(r)
+        count += 1
+    }
+    return end
+}
+
+// Truncate to at most max_cols runes. If ellipsis and truncated, append "…".
+// When ellipsis is used the result may be a new allocation (frame/permanent).
+truncate_cols :: proc(s: string, max_cols: int, ellipsis := false) -> string {
+    if max_cols <= 0 do return ""
+    if display_cols(s) <= max_cols do return s
+    if ellipsis {
+        if max_cols == 1 {
+            return "…"
+        }
+        end := byte_len_for_cols(s, max_cols - 1)
+        return strings.concatenate({s[:end], "…"})
+    }
+    end := byte_len_for_cols(s, max_cols)
+    return s[:end]
+}
+
 // Simple word wrapper for long text (e.g. Summary).
-// Returns a slice of lines that fit within max_width.
+// max_width is in display columns (runes). Returns owned line strings.
 wrap_text :: proc(text: string, max_width: int) -> []string {
     if max_width <= 0 {
         s := make([]string, 1)
@@ -290,25 +325,31 @@ wrap_text :: proc(text: string, max_width: int) -> []string {
     strings.builder_init(&current)
     defer strings.builder_destroy(&current)
 
+    current_cols :: proc(b: ^strings.Builder) -> int {
+        return display_cols(strings.to_string(b^))
+    }
+
     for word in words {
-        if len(word) > max_width {
-            // Hard-wrap very long words
+        wcols := display_cols(word)
+        if wcols > max_width {
+            // Hard-wrap very long words by rune
             if strings.builder_len(current) > 0 {
                 append(&lines, strings.clone(strings.to_string(current)))
                 strings.builder_reset(&current)
             }
             remaining := word
-            for len(remaining) > 0 {
-                chunk_len := min(len(remaining), max_width)
-                append(&lines, strings.clone(remaining[:chunk_len]))
-                remaining = remaining[chunk_len:]
+            for display_cols(remaining) > 0 {
+                take := min(display_cols(remaining), max_width)
+                end := byte_len_for_cols(remaining, take)
+                append(&lines, strings.clone(remaining[:end]))
+                remaining = remaining[end:]
             }
             continue
         }
 
         if strings.builder_len(current) == 0 {
             strings.write_string(&current, word)
-        } else if strings.builder_len(current) + 1 + len(word) <= max_width {
+        } else if current_cols(&current) + 1 + wcols <= max_width {
             strings.write_string(&current, " ")
             strings.write_string(&current, word)
         } else {
@@ -564,10 +605,11 @@ draw :: proc(app: ^App) {
     set_fg(BASE_FG)
 
     // ---------------- Header ----------------
-    set_fg(COLOR_TITLE)
     move_cursor(1,header_y)
     write(strings.repeat(" ", left_width+right_width))
     move_cursor(2,header_y)
+    set_bold()
+    set_fg(COLOR_TITLE)
     write("debtui")
     reset_attrs()
 
@@ -580,6 +622,7 @@ draw :: proc(app: ^App) {
     move_cursor(left_x, list_start_y - 1)
     write(strings.repeat(" ", left_width))
     move_cursor(left_x, list_start_y - 1)
+    set_underline()
     set_fg(COLOR_HEADER)
     write("Available packages")
     if len(app.available) > 0 {
@@ -591,6 +634,7 @@ draw :: proc(app: ^App) {
     move_cursor(right_x, list_start_y - 1)
     write(strings.repeat(" ", right_width))
     move_cursor(right_x, list_start_y - 1)
+    set_underline()
     set_fg(COLOR_HEADER)
     if app.show_help {
         write("Help")
@@ -663,17 +707,15 @@ draw :: proc(app: ^App) {
         sel_pkg := app.available[app.left_selection]
         det := app.details_cache[sel_pkg]
 
-        // Title line (keep cyan as requested) - wrap if extremely long
+        // Title line (keep cyan as requested) — rune-aware truncation
         move_cursor(right_x, detail_y)
         set_bg(DETAIL_BG)
         set_fg(Color.BrightCyan)
         title := det.title
         if title == "" do title = det.package_name
-        if len(title) > right_width {
-            title = title[:right_width]
-        }
+        title = truncate_cols(title, right_width, false)
         write(title)
-        title_pad := right_width - len(title)
+        title_pad := right_width - display_cols(title)
         if title_pad > 0 {
             write(strings.repeat(" ", title_pad))
         }
@@ -696,24 +738,24 @@ draw :: proc(app: ^App) {
             key := field[0]
             value := field[1]
             prefix := strings.concatenate({key, ": "})
-            prefix_len := len(prefix)
-            avail := right_width - prefix_len
+            prefix_cols := display_cols(prefix)
+            avail := right_width - prefix_cols
 
-            if len(value) <= avail {
+            if display_cols(value) <= avail {
                 // Fits on one line
                 move_cursor(right_x, detail_y + row)
                 set_bg(DETAIL_BG)
                 set_fg(DETAIL_FG)
                 write(prefix)
                 write(value)
-                pad := right_width - (prefix_len + len(value))
+                pad := right_width - (prefix_cols + display_cols(value))
                 if pad > 0 {
                     write(strings.repeat(" ", pad))
                 }
                 reset_attrs()
                 row += 1
             } else {
-                // Needs wrapping
+                // Needs wrapping (column-aware)
                 wrapped := wrap_text(value, avail)
                 defer {
                     for line in wrapped { delete(line) }
@@ -726,7 +768,7 @@ draw :: proc(app: ^App) {
                 set_fg(DETAIL_FG)
                 write(prefix)
                 write(wrapped[0])
-                pad := avail - len(wrapped[0])
+                pad := avail - display_cols(wrapped[0])
                 if pad > 0 {
                     write(strings.repeat(" ", pad))
                 }
@@ -734,7 +776,7 @@ draw :: proc(app: ^App) {
                 row += 1
 
                 // Continuation lines (indented under the value)
-                indent := strings.repeat(" ", prefix_len)
+                indent := strings.repeat(" ", prefix_cols)
                 for i := 1; i < len(wrapped); i += 1 {
                     if row >= detail_h - 1 do break
                     move_cursor(right_x, detail_y + row)
@@ -742,7 +784,7 @@ draw :: proc(app: ^App) {
                     set_fg(DETAIL_FG)
                     write(indent)
                     write(wrapped[i])
-                    cont_pad := avail - len(wrapped[i])
+                    cont_pad := avail - display_cols(wrapped[i])
                     if cont_pad > 0 {
                         write(strings.repeat(" ", cont_pad))
                     }
@@ -755,10 +797,9 @@ draw :: proc(app: ^App) {
         // Summary with word wrapping (black bg + bright grey)
         if det.summary != "" && row < detail_h {
             prefix := "Summary: "
-            prefix_len := len(prefix)
-            first_line_width := right_width - prefix_len
+            prefix_cols := display_cols(prefix)
+            first_line_width := right_width - prefix_cols
 
-            // Wrap the summary using the width available after the label for the first line
             wrapped := wrap_text(det.summary, first_line_width)
             defer {
                 for line in wrapped { delete(line) }
@@ -772,7 +813,7 @@ draw :: proc(app: ^App) {
             write(prefix)
             if len(wrapped) > 0 {
                 write(wrapped[0])
-                pad := first_line_width - len(wrapped[0])
+                pad := first_line_width - display_cols(wrapped[0])
                 if pad > 0 {
                     write(strings.repeat(" ", pad))
                 }
@@ -783,8 +824,8 @@ draw :: proc(app: ^App) {
             row += 1
 
             // Continuation lines (use full right_width - indent)
-            indent := strings.repeat(" ", prefix_len)
-            cont_width := right_width - prefix_len
+            indent := strings.repeat(" ", prefix_cols)
+            cont_width := right_width - prefix_cols
             for i := 1; i < len(wrapped); i += 1 {
                 if row >= detail_h do break
                 move_cursor(right_x, detail_y + row)
@@ -792,7 +833,7 @@ draw :: proc(app: ^App) {
                 set_fg(DETAIL_FG)
                 write(indent)
                 write(wrapped[i])
-                pad := cont_width - len(wrapped[i])
+                pad := cont_width - display_cols(wrapped[i])
                 if pad > 0 {
                     write(strings.repeat(" ", pad))
                 }
@@ -807,21 +848,19 @@ draw :: proc(app: ^App) {
             set_bg(DETAIL_BG)
             set_fg(COLOR_DIM)
             preview := det.raw
-            // Keep it reasonable and don't overflow the pane
-            max_preview := right_width * 3
-            if len(preview) > max_preview {
-                preview = preview[:max_preview]
+            // Cap by runes so multi-byte text is not split mid-codepoint
+            max_preview_cols := right_width * 3
+            if display_cols(preview) > max_preview_cols {
+                preview = truncate_cols(preview, max_preview_cols, false)
             }
             lines := strings.split_lines(preview)
             for &ln, li in lines {
                 if li >= 3 || (row + li) >= detail_h do break
                 move_cursor(right_x, detail_y + row + li)
                 ln = strings.trim_space(ln)
-                if len(ln) > right_width {
-                    ln = ln[:right_width]
-                }
+                ln = truncate_cols(ln, right_width, false)
                 write(ln)
-                pad := right_width - len(ln)
+                pad := right_width - display_cols(ln)
                 if pad > 0 {
                     write(strings.repeat(" ", pad))
                 }
@@ -851,12 +890,16 @@ draw :: proc(app: ^App) {
         // Header stays at fixed mid-screen row
         move_cursor(right_x, status_region_y)
         set_bg(DETAIL_BG)
+        set_underline()
         set_fg(COLOR_HEADER)
         header := "Recent Operations"
         write(header)
-        if len(header) < right_width {
-            pad := right_width - len(header)
-            write(strings.repeat(" ", pad))
+        hcols := display_cols(header)
+        if hcols < right_width {
+            // Padding without underline so the rule doesn't span the whole pane
+            reset_attrs()
+            set_bg(DETAIL_BG)
+            write(strings.repeat(" ", right_width - hcols))
         }
         reset_attrs()
 
@@ -912,11 +955,13 @@ draw :: proc(app: ^App) {
                 action_part := line[:colon_idx+2]
                 pkg_part := line[colon_idx+2:]
 
-                total_needed := len(action_part) + len(pkg_part)
-                if total_needed > right_width {
-                    max_pkg := right_width - len(action_part) - 1
+                action_cols := display_cols(action_part)
+                pkg_cols := display_cols(pkg_part)
+                if action_cols + pkg_cols > right_width {
+                    max_pkg := right_width - action_cols - 1
                     if max_pkg < 1 { max_pkg = 1 }
-                    pkg_part = strings.concatenate({pkg_part[:max_pkg], "…"})
+                    pkg_part = truncate_cols(pkg_part, max_pkg, true)
+                    pkg_cols = display_cols(pkg_part)
                 }
 
                 set_fg(action_color)
@@ -924,19 +969,17 @@ draw :: proc(app: ^App) {
                 set_fg(COLOR_NORMAL)
                 write(pkg_part)
 
-                written := len(action_part) + len(pkg_part)
+                written := action_cols + pkg_cols
                 if written < right_width {
                     write(strings.repeat(" ", right_width - written))
                 }
             } else {
                 set_fg(action_color)
-                txt := line
-                if len(txt) > right_width {
-                    txt = strings.concatenate({txt[:right_width-1], "…"})
-                }
+                txt := truncate_cols(line, right_width, true)
                 write(txt)
-                if len(txt) < right_width {
-                    write(strings.repeat(" ", right_width - len(txt)))
+                tcols := display_cols(txt)
+                if tcols < right_width {
+                    write(strings.repeat(" ", right_width - tcols))
                 }
             }
             reset_attrs()
@@ -1358,44 +1401,33 @@ draw_help_pane :: proc(x, y, width, height: int) {
     for line in lines {
         if row >= height do break
 
-        // Soft-wrap long lines into the pane width
+        // Soft-wrap long lines into the pane width (column-aware)
         if len(line) == 0 {
             row += 1
             continue
         }
 
-        if len(line) <= width {
+        is_title := row == 0 && strings.has_prefix(line, "debtui")
+        is_section := strings.has_prefix(line, "Keys:") || strings.has_prefix(line, "Markers:")
+        wrapped := wrap_text(line, width)
+        for wl, wi in wrapped {
+            if row >= height do break
             move_cursor(x, y + row)
             set_bg(DETAIL_BG)
-            if row == 0 {
+            if is_title && wi == 0 {
                 set_fg(Color.BrightCyan)
-            } else if strings.has_prefix(line, "Keys:") || strings.has_prefix(line, "Markers:") {
+            } else if is_section && wi == 0 {
                 set_fg(COLOR_HEADER)
             } else {
                 set_fg(DETAIL_FG)
             }
-            write(line)
-            pad := width - len(line)
+            write(wl)
+            pad := width - display_cols(wl)
             if pad > 0 {
                 write(strings.repeat(" ", pad))
             }
             reset_attrs()
             row += 1
-        } else {
-            wrapped := wrap_text(line, width)
-            for wl in wrapped {
-                if row >= height do break
-                move_cursor(x, y + row)
-                set_bg(DETAIL_BG)
-                set_fg(DETAIL_FG)
-                write(wl)
-                pad := width - len(wl)
-                if pad > 0 {
-                    write(strings.repeat(" ", pad))
-                }
-                reset_attrs()
-                row += 1
-            }
         }
     }
 }
@@ -1513,7 +1545,8 @@ replace_last_status_line :: proc(app: ^App, line: string) {
 }
 
 // Masked password entry in the Recent Operations panel.
-// Returns a heap-allocated password string; caller must zero_and_delete_string.
+// Accepts full UTF-8 (multi-byte runes). Returns a heap-allocated password string;
+// caller must zero_and_delete_string.
 read_password_in_ro :: proc(app: ^App) -> (password: string, ok: bool) {
     password_entry_active = true
     defer password_entry_active = false
@@ -1523,7 +1556,7 @@ read_password_in_ro :: proc(app: ^App) -> (password: string, ok: bool) {
     draw(app)
 
     buf: [512]byte
-    n := 0
+    n := 0 // byte length of UTF-8 password so far
 
     for {
         key := read_key()
@@ -1543,8 +1576,13 @@ read_password_in_ro :: proc(app: ^App) -> (password: string, ok: bool) {
 
             case .Backspace:
                 if n > 0 {
-                    n -= 1
-                    buf[n] = 0
+                    // Remove one Unicode scalar (last rune), not one byte
+                    _, size := utf8.decode_last_rune(string(buf[:n]))
+                    if size <= 0 do size = 1
+                    for i in (n - size)..<n {
+                        buf[i] = 0
+                    }
+                    n -= size
                 }
 
             case .Escape, .CtrlC:
@@ -1560,9 +1598,15 @@ read_password_in_ro :: proc(app: ^App) -> (password: string, ok: bool) {
             }
 
         case rune:
-            if k >= 32 && k < 127 && n < len(buf) {
-                buf[n] = u8(k)
-                n += 1
+            // Accept any printable Unicode scalar (skip C0 controls)
+            if k >= 32 && n < len(buf) {
+                encoded, size := utf8.encode_rune(k)
+                if size > 0 && n + size <= len(buf) {
+                    for i in 0..<size {
+                        buf[n + i] = encoded[i]
+                    }
+                    n += size
+                }
             }
 
         case Timeout:
@@ -1573,15 +1617,17 @@ read_password_in_ro :: proc(app: ^App) -> (password: string, ok: bool) {
             // ignore
         }
 
-        // Update mask row: only asterisks, never the real password (stack buffer, no leak)
+        // Mask by rune count (one * per Unicode scalar)
         if n == 0 {
             replace_last_status_line(app, "")
         } else {
+            n_runes := utf8.rune_count(string(buf[:n]))
             mask_buf: [512]byte
-            for i in 0..<n {
+            if n_runes > len(mask_buf) do n_runes = len(mask_buf)
+            for i in 0..<n_runes {
                 mask_buf[i] = '*'
             }
-            replace_last_status_line(app, string(mask_buf[:n]))
+            replace_last_status_line(app, string(mask_buf[:n_runes]))
         }
         draw(app)
     }
