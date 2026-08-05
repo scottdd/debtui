@@ -203,10 +203,57 @@ Package_Details :: struct {
     repository:   string,
     updater:      string,
     installed:    string,   // "No" or version string
+    published:    string,   // available version (deb-get updater); often empty for apt
     architecture: string,
     website:      string,
     summary:      string,
     raw:          string,   // full original output for fallback display
+}
+
+// Max age of a details cache file before `u` will re-fetch it (installed only).
+// Everyday browse still uses CACHE_TTL_SECONDS (7 days).
+UPDATE_SCAN_MAX_AGE_SECONDS :: 24 * 60 * 60
+
+// Apply a single "  Key: value" line to details. Returns true if recognized.
+apply_details_field :: proc(d: ^Package_Details, line: string) -> bool {
+    if strings.has_prefix(line, "  Package:") {
+        // Prefer the first Package: line (some entries print secondary repo lines later)
+        if d.package_name == "" {
+            d.package_name = strings.trim_space(line[len("  Package:"):])
+        }
+        return true
+    }
+    if strings.has_prefix(line, "  Repository:") {
+        if d.repository == "" {
+            d.repository = strings.trim_space(line[len("  Repository:"):])
+        }
+        return true
+    }
+    if strings.has_prefix(line, "  Updater:") {
+        d.updater = strings.trim_space(line[len("  Updater:"):])
+        return true
+    }
+    if strings.has_prefix(line, "  Installed:") {
+        d.installed = strings.trim_space(line[len("  Installed:"):])
+        return true
+    }
+    if strings.has_prefix(line, "  Published:") {
+        d.published = strings.trim_space(line[len("  Published:"):])
+        return true
+    }
+    if strings.has_prefix(line, "  Architecture:") {
+        d.architecture = strings.trim_space(line[len("  Architecture:"):])
+        return true
+    }
+    if strings.has_prefix(line, "  Website:") {
+        d.website = strings.trim_space(line[len("  Website:"):])
+        return true
+    }
+    if strings.has_prefix(line, "  Summary:") {
+        d.summary = strings.trim_space(line[len("  Summary:"):])
+        return true
+    }
+    return false
 }
 
 parse_details :: proc(raw: string) -> Package_Details {
@@ -222,22 +269,7 @@ parse_details :: proc(raw: string) -> Package_Details {
             continue
         }
 
-        if strings.has_prefix(line, "  Package:") {
-            d.package_name = strings.trim_space(line[10:])
-        } else if strings.has_prefix(line, "  Repository:") {
-            d.repository = strings.trim_space(line[13:])
-        } else if strings.has_prefix(line, "  Updater:") {
-            d.updater = strings.trim_space(line[10:])
-        } else if strings.has_prefix(line, "  Installed:") {
-            d.installed = strings.trim_space(line[12:])
-        } else if strings.has_prefix(line, "  Architecture:") {
-            d.architecture = strings.trim_space(line[15:])
-        } else if strings.has_prefix(line, "  Website:") {
-            d.website = strings.trim_space(line[10:])
-        } else if strings.has_prefix(line, "  Summary:") {
-            d.summary = strings.trim_space(line[10:])
-            // Some summaries might be multi-line? For now take first.
-        }
+        _ = apply_details_field(&d, line)
     }
 
     if d.title == "" {
@@ -245,6 +277,102 @@ parse_details :: proc(raw: string) -> Package_Details {
     }
 
     return d
+}
+
+// Parse `deb-get show pkg1 pkg2 ...` multi-package output into one entry per package.
+// Field strings are slices into `raw` (caller must keep `raw` alive or clone fields).
+parse_details_list :: proc(raw: string) -> [dynamic]Package_Details {
+    results := make([dynamic]Package_Details)
+    current: Package_Details
+    has_block := false
+
+    lines := strings.split_lines(raw)
+    for line in lines {
+        trimmed := strings.trim_right_space(line)
+        if trimmed == "" do continue
+
+        // Package title lines are unindented; status/warning lines from deb-get are indented.
+        if !strings.has_prefix(trimmed, " ") && !strings.has_prefix(trimmed, "\t") {
+            if has_block && current.package_name != "" {
+                if current.title == "" {
+                    current.title = current.package_name
+                }
+                append(&results, current)
+            }
+            current = Package_Details{title = strings.trim_space(trimmed)}
+            has_block = true
+            continue
+        }
+
+        if apply_details_field(&current, trimmed) {
+            has_block = true
+        }
+    }
+
+    if has_block && current.package_name != "" {
+        if current.title == "" {
+            current.title = current.package_name
+        }
+        append(&results, current)
+    }
+
+    return results
+}
+
+// Run `deb-get show` for one or more packages, parse, write disk cache, return parsed list.
+// On total failure returns empty list.
+fetch_package_details_batch :: proc(pkgs: []string) -> [dynamic]Package_Details {
+    results := make([dynamic]Package_Details)
+    if len(pkgs) == 0 {
+        return results
+    }
+
+    args := make([]string, len(pkgs) + 1)
+    defer delete(args)
+    args[0] = "show"
+    for i in 0..<len(pkgs) {
+        args[i + 1] = pkgs[i]
+    }
+
+    out, ok := run_debget(..args)
+    // Keep `out` alive: parsed field strings slice into it (same pattern as get_package_details).
+    if (!ok && out == "") || out == "" {
+        return results
+    }
+
+    if len(pkgs) == 1 {
+        details := parse_details(out)
+        if details.package_name == "" {
+            details.package_name = pkgs[0]
+        }
+        if is_details_sane(details) {
+            save_details_to_cache(details.package_name, details)
+            append(&results, details)
+        }
+        return results
+    }
+
+    list := parse_details_list(out)
+    defer delete(list)
+
+    by_name := make(map[string]Package_Details)
+    defer delete(by_name)
+    for d in list {
+        if d.package_name == "" || !is_details_sane(d) do continue
+        save_details_to_cache(d.package_name, d)
+        by_name[d.package_name] = d
+        append(&results, d)
+    }
+
+    // Fall back to single-package show for any names missing from multi parse.
+    for pkg in pkgs {
+        if _, found := by_name[pkg]; found do continue
+        if details, ok2 := get_package_details(pkg); ok2 {
+            append(&results, details)
+        }
+    }
+
+    return results
 }
 
 // Execute install for a list of packages.
@@ -629,5 +757,81 @@ is_details_sane :: proc(d: Package_Details) -> bool {
     if len(d.summary) > 256*1024 { return false }
     if len(d.title) > 4096 || len(d.package_name) > 256 { return false }
     if len(d.website) > 8192 { return false }
+    if len(d.published) > 256 { return false }
     return true
+}
+
+// True if `newer` is strictly greater than `older` per dpkg version rules.
+// Empty either side → false (unknown, not an update).
+version_is_newer :: proc(newer, older: string) -> bool {
+    if newer == "" || older == "" do return false
+    // dpkg --compare-versions A gt B  → exit 0 if A > B
+    cmd := fmt.tprintf(
+        "dpkg --compare-versions %s gt %s",
+        shell_quote(newer, context.temp_allocator),
+        shell_quote(older, context.temp_allocator),
+    )
+    ccmd := strings.clone_to_cstring(cmd, context.temp_allocator)
+    return libc.system(ccmd) == 0
+}
+
+// True when details indicate a deb-get-managed package has a newer Published version.
+// Empty Published or non-comparable versions → not an update (unknown).
+package_has_update :: proc(d: Package_Details) -> bool {
+    inst := strings.trim_space(d.installed)
+    pub := strings.trim_space(d.published)
+    if inst == "" || inst == "No" do return false
+    if pub == "" do return false
+    // Apt-backed packages usually have no Published line; if present, still compare.
+    // Prefer deb-get updater when known.
+    up := strings.trim_space(d.updater)
+    if up != "" && up != "deb-get" do return false
+    return version_is_newer(pub, inst)
+}
+
+// Read cache file metadata without the 7-day soft miss used by load_details_from_cache.
+// ok=false if missing, unreadable, corrupt, or past the hard 7-day TTL.
+load_cached_details_meta :: proc(pkg: string) -> (details: Package_Details, cached_at: i64, ok: bool) {
+    path := get_package_cache_path(pkg)
+    defer delete(path)
+
+    if !os.exists(path) {
+        return {}, 0, false
+    }
+
+    data, read_err := os.read_entire_file_from_path(path, context.allocator)
+    if read_err != nil {
+        return {}, 0, false
+    }
+    defer delete(data, context.allocator)
+
+    if len(data) > 4 * 1024 * 1024 {
+        return {}, 0, false
+    }
+
+    cached: Cached_Details
+    if json.unmarshal(data, &cached) != nil {
+        return {}, 0, false
+    }
+    cached.details.raw = ""
+    if !is_details_sane(cached.details) {
+        return {}, 0, false
+    }
+    if cached.details.package_name != "" && cached.details.package_name != pkg {
+        return {}, 0, false
+    }
+
+    now := time.to_unix_seconds(time.now())
+    if now - cached.cached_at > CACHE_TTL_SECONDS {
+        return {}, 0, false
+    }
+    return cached.details, cached.cached_at, true
+}
+
+// True if `u` should re-run deb-get show for this package (missing or ≥ 24h old).
+cache_stale_for_update_scan :: proc(pkg: string) -> bool {
+    _, cached_at, ok := load_cached_details_meta(pkg)
+    if !ok do return true
+    now := time.to_unix_seconds(time.now())
+    return now - cached_at >= UPDATE_SCAN_MAX_AGE_SECONDS
 }

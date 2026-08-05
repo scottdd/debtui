@@ -9,11 +9,12 @@ import "core:strings"
 import "core:time"
 import "core:mem"
 import "core:slice"
+import "core:unicode/utf8"
 
 // Set while the RO panel is collecting a sudo password (status bar hint changes).
 password_entry_active := false
 
-DEBTUI_VERSION :: "0.2.0"
+DEBTUI_VERSION :: "0.3.0"
 
 // Global verbose flag controlled by --verbose / -v.
 // When false, we suppress the detailed diagnostic logging that was added
@@ -41,12 +42,22 @@ draw_frame_arena: mem.Arena
 //   +------------------------------------------------------------+
 //
 // All marking and navigation happens in the single left list.
-// Space = toggle mark (install if free, remove if installed).
+// Space = toggle mark (install if free; installed: clear update → remove → clear).
+// u = scan installed (cache ≥24h) for updates and mark them.
 // Details always reflect the left list selection (or Help when show_help).
 // ============================================================================
 
 // Minimum seconds between user-initiated list fetches (f). Startup counts as a fetch.
 FETCH_COOLDOWN_SECONDS :: 30
+
+// Max packages to fetch via `deb-get show` in one burst (startup, scroll, or u).
+DETAILS_FETCH_CHUNK :: 5
+
+// Show a Recent Operations "loading details" line when fetching more than this many.
+DETAILS_LOAD_MSG_THRESHOLD :: 4
+
+// Passive RO nudge (shown at most once until cleared / after c with known updates).
+UPDATES_HINT_MSG :: "updates are available. Press u to mark all updates"
 
 // --------------------------- App State ---------------------------------------
 
@@ -58,9 +69,15 @@ App :: struct {
     // Which packages are already installed (for quick lookup + markers in left list)
     installed_set: map[string]bool,
 
-    // Pending actions
+    // Pending actions (update marks reuse pending_install for installed packages)
     pending_install: map[string]bool,
     pending_remove:  map[string]bool,
+
+    // Session-only: installed packages known to have a newer Published version
+    update_available: map[string]bool,
+
+    // Passive RO hint: show once until u/c/apply changes staging; after c may re-show
+    updates_hint_shown: bool,
 
     // Left list (the only list) state
     left_selection:  int,
@@ -85,6 +102,9 @@ App :: struct {
     // Holds pending marks while staging, then apply results after Enter.
     status_lines:  [dynamic]string,
     status_scroll: int,
+
+    // When true, draw() skips ensure_selection_details (avoids re-entrant fetch).
+    skip_details_ensure: bool,
 }
 
 // --------------------------- List helpers ------------------------------------
@@ -167,8 +187,9 @@ DETAIL_BG :: BgColor.Black
 DETAIL_FG :: Color.BrightWhite   // bright grey / light text on black for detail lines
 
 // Draw a single list item with optional markers.
-// Always writes exactly `width` characters so the pane looks solid.
-draw_list_item :: proc(x, y, width: int, text: string, is_selected: bool, is_installed: bool, is_pending_install: bool, is_pending_remove: bool) {
+// Always writes exactly `width` columns so the pane looks solid.
+// is_pending_update: installed + marked for upgrade (shown as [↑]).
+draw_list_item :: proc(x, y, width: int, text: string, is_selected: bool, is_installed: bool, is_pending_install: bool, is_pending_remove: bool, is_pending_update: bool) {
     move_cursor(x, y)
 
     bg := BASE_BG
@@ -176,7 +197,10 @@ draw_list_item :: proc(x, y, width: int, text: string, is_selected: bool, is_ins
     tag_fg := COLOR_NORMAL
     prefix := "  "
 
-    if is_pending_install {
+    if is_pending_update {
+        tag_fg = COLOR_PENDING_ADD
+        prefix = "[↑]"
+    } else if is_pending_install {
         tag_fg = COLOR_PENDING_ADD
         prefix = "[+]"
     } else if is_pending_remove {
@@ -191,7 +215,7 @@ draw_list_item :: proc(x, y, width: int, text: string, is_selected: bool, is_ins
         bg = BG_SELECTED
         text_fg = COLOR_SELECTED
         // On the focused row, use a high-contrast bright color for the tag
-        // so [i] / [+] / [-] remain clearly visible against the cyan highlight.
+        // so markers remain clearly visible against the cyan highlight.
         if prefix != "  " {
             tag_fg = COLOR_SELECTED
         }
@@ -199,32 +223,42 @@ draw_list_item :: proc(x, y, width: int, text: string, is_selected: bool, is_ins
 
     set_bg(bg)
 
-    tag_display := "   "   // normal (no marker) alignment: three spaces
-    tag_len := 3
+    tag_display := "   "   // normal (no marker) alignment: three columns
+    tag_cols := 3
     if prefix != "  " {
         tag_display = strings.concatenate({" ", prefix, " "})
-        tag_len = len(tag_display)
+        tag_cols = utf8.rune_count_in_string(tag_display)
     }
 
     // Write the tag/marker portion in tag_fg (bright on focused row)
     set_fg(tag_fg)
     write(tag_display)
 
-    // Write package name (possibly truncated) + padding in text color
+    // Write package name (possibly truncated) + padding in text color.
+    // Use rune/column counts so multi-byte markers like [↑] stay aligned.
     set_fg(text_fg)
     name := text
-    if tag_len + len(name) > width {
-        max_name := width - tag_len - 1
+    name_cols := utf8.rune_count_in_string(name)
+    if tag_cols + name_cols > width {
+        max_name := width - tag_cols - 1
         if max_name < 1 {
             max_name = 1
         }
-        name = strings.concatenate({name[:max_name], "…"})
+        // Truncate by runes, then append ellipsis
+        end := 0
+        count := 0
+        for r in name {
+            if count >= max_name do break
+            end += utf8.rune_size(r)
+            count += 1
+        }
+        name = strings.concatenate({name[:end], "…"})
+        name_cols = count + 1
     }
 
     write(name)
 
-    // Pad the rest of the line with the background color
-    written := tag_len + len(name)
+    written := tag_cols + name_cols
     remaining := width - written
     if remaining > 0 {
         spaces := strings.repeat(" ", remaining)
@@ -307,8 +341,128 @@ recent_ops_header_y :: proc(term_h, list_start_y: int) -> int {
     return y
 }
 
+// Record / clear session update_available from details; optional passive RO hint.
+note_package_update_status :: proc(app: ^App, pkg: string, d: Package_Details) {
+    if !app.installed_set[pkg] {
+        delete_key(&app.update_available, pkg)
+        return
+    }
+    if package_has_update(d) {
+        app.update_available[pkg] = true
+        maybe_show_updates_hint(app)
+    } else if strings.trim_space(d.published) != "" {
+        // Definitive "have Published, not newer" → clear any prior flag
+        delete_key(&app.update_available, pkg)
+    }
+    // Empty Published → unknown; leave existing flag alone
+}
+
+// Once-per-session (or after c resets the flag) RO nudge when we know updates exist.
+maybe_show_updates_hint :: proc(app: ^App) {
+    if len(app.update_available) == 0 do return
+    if app.updates_hint_shown do return
+
+    for line in app.status_lines {
+        if line == UPDATES_HINT_MSG do return
+    }
+    append_status_line(app, UPDATES_HINT_MSG)
+    app.updates_hint_shown = true
+    app.needs_redraw = true
+}
+
+// Store batch results in details_cache (keys from available[] / need list).
+apply_fetched_details :: proc(app: ^App, need: []string, fetched: []Package_Details) {
+    for pkg in need {
+        if _, already := app.details_cache[pkg]; already do continue
+        found := false
+        for d in fetched {
+            if d.package_name == pkg {
+                app.details_cache[pkg] = d
+                note_package_update_status(app, pkg, d)
+                found = true
+                break
+            }
+        }
+        if !found {
+            app.details_cache[pkg] = Package_Details{
+                package_name = pkg,
+                raw = "Failed to fetch details from deb-get",
+            }
+        }
+    }
+}
+
+// Fetch up to DETAILS_FETCH_CHUNK packages via deb-get show; optional RO progress.
+fetch_details_chunk :: proc(app: ^App, need: []string) {
+    if len(need) == 0 do return
+
+    show_progress := len(need) > DETAILS_LOAD_MSG_THRESHOLD
+    if show_progress {
+        append_status_line(app, fmt.tprintf("loading details: 0/%d", len(need)))
+        for pkg in need {
+            if _, ok := app.details_cache[pkg]; !ok {
+                app.details_cache[pkg] = Package_Details{
+                    package_name = pkg,
+                    title        = pkg,
+                    summary      = "Loading package details…",
+                }
+            }
+        }
+        app.skip_details_ensure = true
+        draw(app)
+        app.skip_details_ensure = false
+        for pkg in need {
+            if d, ok := app.details_cache[pkg]; ok && d.summary == "Loading package details…" {
+                delete_key(&app.details_cache, pkg)
+            }
+        }
+    }
+
+    fetched := fetch_package_details_batch(need)
+    apply_fetched_details(app, need, fetched[:])
+    delete(fetched)
+
+    if show_progress {
+        if len(app.status_lines) > 0 {
+            last := app.status_lines[len(app.status_lines) - 1]
+            if strings.has_prefix(last, "loading details") {
+                delete(last)
+                pop(&app.status_lines)
+            }
+        }
+        app.needs_redraw = true
+    }
+}
+
+// Collect up to `limit` packages that still need a network fetch, starting at
+// start_idx and walking forward (wraps). Fresh disk hits are loaded into memory
+// and do not count toward the limit.
+collect_details_to_fetch :: proc(app: ^App, start_idx: int, limit: int) -> [dynamic]string {
+    need := make([dynamic]string, 0, limit)
+    n := len(app.available)
+    if n == 0 || limit <= 0 do return need
+
+    start := start_idx
+    if start < 0 do start = 0
+    if start >= n do start = 0
+
+    for offset in 0..<n {
+        if len(need) >= limit do break
+        pkg := app.available[(start + offset) % n]
+        if _, ok := app.details_cache[pkg]; ok do continue
+        if details, ok := load_details_from_cache(pkg); ok {
+            app.details_cache[pkg] = details
+            note_package_update_status(app, pkg, details)
+            continue
+        }
+        append(&need, pkg)
+    }
+    return need
+}
+
 // Ensure package details for the current selection use the permanent allocator
 // (must run before switching context.allocator to the draw-frame arena).
+// On cache miss/expired: fetch this package plus the next few missing ones (chunk).
 ensure_selection_details :: proc(app: ^App) {
     if len(app.available) == 0 || app.left_selection >= len(app.available) {
         return
@@ -320,14 +474,16 @@ ensure_selection_details :: proc(app: ^App) {
     if _, ok := app.details_cache[sel_pkg]; ok {
         return
     }
-    if details, ok2 := get_package_details(sel_pkg); ok2 {
+    // Try disk first (cheap); only burst-fetch when the focused package needs network.
+    if details, ok := load_details_from_cache(sel_pkg); ok {
         app.details_cache[sel_pkg] = details
-    } else {
-        app.details_cache[sel_pkg] = Package_Details{
-            package_name = sel_pkg,
-            raw = "Failed to fetch details from deb-get",
-        }
+        note_package_update_status(app, sel_pkg, details)
+        return
     }
+
+    need := collect_details_to_fetch(app, app.left_selection, DETAILS_FETCH_CHUNK)
+    defer delete(need)
+    fetch_details_chunk(app, need[:])
 }
 
 // Main draw routine - called after every significant state change
@@ -369,7 +525,9 @@ draw :: proc(app: ^App) {
     status_portion_h := max(0, (h - 1) - status_region_y) // down to row above bottom status bar
 
     // Fetch details with permanent allocator before frame-local arena
-    ensure_selection_details(app)
+    if !app.skip_details_ensure {
+        ensure_selection_details(app)
+    }
 
     // Frame arena: all padding / wrap allocations for this draw are freed when
     // we leave (arena reset next frame via re-init).
@@ -450,8 +608,9 @@ draw :: proc(app: ^App) {
         is_inst := app.installed_set[pkg]
         is_pend := app.pending_install[pkg]
         is_pend_rm := app.pending_remove[pkg]
+        is_pend_upd := is_inst && is_pend && !is_pend_rm
 
-        draw_list_item(left_x, y, left_width, pkg, is_sel, is_inst, is_pend, is_pend_rm)
+        draw_list_item(left_x, y, left_width, pkg, is_sel, is_inst, is_pend && !is_pend_upd, is_pend_rm, is_pend_upd)
     }
 
     // ---------------- RIGHT: details above mid-screen; RO header fixed; log below ----------------
@@ -493,6 +652,7 @@ draw :: proc(app: ^App) {
         fields := [?][2]string{
             {"Package",     det.package_name},
             {"Installed",   det.installed},
+            {"Published",   det.published},
             {"Website",     det.website},
         }
 
@@ -696,7 +856,9 @@ draw :: proc(app: ^App) {
             // Color by line kind
             action_color := COLOR_NORMAL
             if strings.has_prefix(line, "marked for installation:") ||
-               strings.has_prefix(line, "installed:") {
+               strings.has_prefix(line, "marked for update:") ||
+               strings.has_prefix(line, "installed:") ||
+               strings.has_prefix(line, "updated:") {
                 action_color = Color.BrightGreen
             } else if strings.has_prefix(line, "marked for removal:") ||
                       strings.has_prefix(line, "removed:") {
@@ -705,6 +867,8 @@ draw :: proc(app: ^App) {
                 action_color = Color.BrightRed
             } else if strings.has_prefix(line, "fetch") ||
                       strings.has_prefix(line, "Fetched") ||
+                      strings.has_prefix(line, "scanning ") ||
+                      strings.has_prefix(line, "updates are available") ||
                       strings.has_prefix(line, "sudo") ||
                       strings.has_prefix(line, "password") {
                 action_color = Color.BrightYellow
@@ -758,7 +922,7 @@ draw :: proc(app: ^App) {
     if password_entry_active {
         write("sudo password  Enter: submit  Esc/Ctrl+C: cancel  (hidden in Recent Operations)")
     } else {
-        write("↑↓/jk  Space: mark  Enter: apply  c: clear  f: fetch  ?: help  q: quit")
+        write("↑↓/jk  Space: mark  Enter: apply  u: updates  c: clear  f: fetch  ?: help  q: quit")
     }
 
     reset_attrs()
@@ -774,6 +938,7 @@ init_app :: proc() -> App {
         installed_set     = make(map[string]bool),
         pending_install   = make(map[string]bool),
         pending_remove    = make(map[string]bool),
+        update_available  = make(map[string]bool),
         status_lines      = make([dynamic]string),
     }
     return app
@@ -784,6 +949,7 @@ destroy_app :: proc(app: ^App) {
     delete(app.installed_set)
     delete(app.pending_install)
     delete(app.pending_remove)
+    delete(app.update_available)
     for line in app.status_lines {
         delete(line)
     }
@@ -821,6 +987,22 @@ refresh_data :: proc(app: ^App) -> bool {
         app.installed_set[p] = true
     }
 
+    // In-memory details keys pointed at the previous available[] strings; drop them.
+    // Disk cache is the durable source of truth and is rehydrated by preload.
+    clear(&app.details_cache)
+
+    // Drop update flags for packages no longer installed
+    to_drop := make([dynamic]string, 0, len(app.update_available))
+    defer delete(to_drop)
+    for p in app.update_available {
+        if !app.installed_set[p] {
+            append(&to_drop, p)
+        }
+    }
+    for p in to_drop {
+        delete_key(&app.update_available, p)
+    }
+
     // Clean up old/stale cache entries for packages no longer available
     cleanup_persistent_cache(avail)
     log_cache_error("refresh_data: persistent cache cleanup returned successfully")
@@ -833,7 +1015,37 @@ refresh_data :: proc(app: ^App) -> bool {
     return true
 }
 
-// Context-aware toggle: not installed ↔ mark install; installed ↔ mark remove.
+// After the package list is known: rehydrate fresh disk-cache hits into memory,
+// then fetch at most DETAILS_FETCH_CHUNK missing/expired entries (from selection).
+// Further gaps are filled on demand when the user focuses a package still missing.
+preload_missing_details :: proc(app: ^App) {
+    if len(app.available) == 0 {
+        return
+    }
+
+    // Disk hits are cheap — load them all so cached packages scroll smoothly.
+    for pkg in app.available {
+        if _, ok := app.details_cache[pkg]; ok do continue
+        if details, ok := load_details_from_cache(pkg); ok {
+            app.details_cache[pkg] = details
+            note_package_update_status(app, pkg, details)
+        }
+    }
+
+    start := app.left_selection
+    if start < 0 || start >= len(app.available) {
+        start = 0
+    }
+    need := collect_details_to_fetch(app, start, DETAILS_FETCH_CHUNK)
+    defer delete(need)
+    fetch_details_chunk(app, need[:])
+}
+
+// Context-aware toggle:
+//   not installed: toggle install mark
+//   installed + update mark: clear update
+//   installed + remove mark: clear remove
+//   installed clean: mark remove (remove wins over update)
 // Recent Operations list is rebuilt from pending maps after every change.
 toggle_mark :: proc(app: ^App) {
     if len(app.available) == 0 do return
@@ -842,8 +1054,10 @@ toggle_mark :: proc(app: ^App) {
     pkg := app.available[app.left_selection]
 
     if app.installed_set[pkg] {
-        // Installed: toggle remove mark
-        if app.pending_remove[pkg] {
+        if app.pending_install[pkg] {
+            // Clear update mark first
+            delete_key(&app.pending_install, pkg)
+        } else if app.pending_remove[pkg] {
             delete_key(&app.pending_remove, pkg)
         } else {
             app.pending_remove[pkg] = true
@@ -862,11 +1076,148 @@ toggle_mark :: proc(app: ^App) {
     app.needs_redraw = true
 }
 
-// Clear all pending install/remove marks and empty the staging list in RO.
+// Clear all pending install/remove/update marks and empty the staging list in RO.
+// If we still know about updates from cache, re-show the passive hint.
 clear_marks :: proc(app: ^App) {
     clear(&app.pending_install)
     clear(&app.pending_remove)
     clear_status_lines(app)
+    app.updates_hint_shown = false
+    if len(app.update_available) > 0 {
+        maybe_show_updates_hint(app)
+    }
+    app.needs_redraw = true
+}
+
+// Drain non-blocking keys; true if Escape or Ctrl+C was pressed (cancel long op).
+poll_cancel_key :: proc() -> bool {
+    for {
+        key := read_key()
+        switch k in key {
+        case Timeout:
+            return false
+        case Special_Key:
+            if k == .Escape || k == .CtrlC {
+                return true
+            }
+        case rune:
+            // ignore
+        case Unknown_Escape:
+            // ignore
+        }
+    }
+}
+
+// `u`: refresh installed packages with missing/≥24h cache, then mark all known updates.
+// Progress in RO; Esc cancels remaining fetches but keeps marks already applied.
+mark_all_updates :: proc(app: ^App) {
+    if len(app.installed) == 0 {
+        clear_status_lines(app)
+        append_status_line(app, "no updates to mark")
+        app.needs_redraw = true
+        return
+    }
+
+    // Ensure installed packages with warm cache are loaded into memory for compare.
+    for pkg in app.installed {
+        if _, ok := app.details_cache[pkg]; ok do continue
+        if details, cached_at, ok := load_cached_details_meta(pkg); ok {
+            now := time.to_unix_seconds(time.now())
+            if now - cached_at < UPDATE_SCAN_MAX_AGE_SECONDS {
+                app.details_cache[pkg] = details
+                note_package_update_status(app, pkg, details)
+            }
+        }
+    }
+
+    // Packages that need a network re-fetch for the update scan
+    to_scan := make([dynamic]string, 0, len(app.installed))
+    defer delete(to_scan)
+    for pkg in app.installed {
+        if cache_stale_for_update_scan(pkg) {
+            append(&to_scan, pkg)
+        } else if det, ok := app.details_cache[pkg]; ok {
+            note_package_update_status(app, pkg, det)
+        } else if details, _, ok2 := load_cached_details_meta(pkg); ok2 {
+            app.details_cache[pkg] = details
+            note_package_update_status(app, pkg, details)
+        }
+    }
+
+    cancelled := false
+    if len(to_scan) > 0 {
+        append_status_line(app, fmt.tprintf("scanning 0 of %d for updates", len(to_scan)))
+        app.skip_details_ensure = true
+        draw(app)
+        app.skip_details_ensure = false
+
+        done := 0
+        for i := 0; i < len(to_scan); i += DETAILS_FETCH_CHUNK {
+            if poll_cancel_key() {
+                cancelled = true
+                break
+            }
+            end := min(i + DETAILS_FETCH_CHUNK, len(to_scan))
+            batch := to_scan[i:end]
+
+            // Drop any in-memory entry so apply_fetched_details will store fresh results
+            for pkg in batch {
+                delete_key(&app.details_cache, pkg)
+            }
+
+            fetched := fetch_package_details_batch(batch)
+            apply_fetched_details(app, batch, fetched[:])
+            delete(fetched)
+
+            done = end
+            replace_last_status_line(app, fmt.tprintf("scanning %d of %d for updates", done, len(to_scan)))
+            app.skip_details_ensure = true
+            draw(app)
+            app.skip_details_ensure = false
+        }
+
+        // Remove scanning progress line
+        if len(app.status_lines) > 0 {
+            last := app.status_lines[len(app.status_lines) - 1]
+            if strings.has_prefix(last, "scanning ") {
+                delete(last)
+                pop(&app.status_lines)
+            }
+        }
+    }
+
+    // Mark all known updates (except pending remove)
+    marked := 0
+    for pkg in app.installed {
+        if app.pending_remove[pkg] do continue
+        has := app.update_available[pkg]
+        if !has {
+            if det, ok := app.details_cache[pkg]; ok && package_has_update(det) {
+                app.update_available[pkg] = true
+                has = true
+            }
+        }
+        if has {
+            app.pending_install[pkg] = true
+            marked += 1
+        }
+    }
+
+    app.updates_hint_shown = true // don't re-nudge after explicit u
+
+    if marked == 0 {
+        // Keep any prior non-staging lines minimal
+        clear_status_lines(app)
+        if cancelled {
+            append_status_line(app, "update scan cancelled")
+        }
+        append_status_line(app, "no updates to mark")
+    } else {
+        sync_pending_ops_list(app)
+        if cancelled {
+            append_status_line(app, "update scan cancelled (partial marks kept)")
+        }
+    }
     app.needs_redraw = true
 }
 
@@ -894,6 +1245,8 @@ fetch_list :: proc(app: ^App) {
             clear_status_lines(app)
             append_status_line(app, "fetched package lists from deb-get")
         }
+        // Warm details for cache misses (may show its own RO progress line).
+        preload_missing_details(app)
     } else if app.last_error != "" {
         append_status_line(app, app.last_error)
     }
@@ -907,9 +1260,9 @@ draw_help_pane :: proc(x, y, width, height: int) {
         "debtui — TUI front-end for deb-get",
         "",
         "Browse packages in the left list. Space toggles",
-        "a mark (install if free, remove if installed).",
-        "Enter applies all marks. Recent Operations shows",
-        "results of apply.",
+        "marks. Installed: clear update → remove → clear.",
+        "u scans installed packages for updates and marks",
+        "them. Enter applies all marks.",
         "",
         "Keys:",
         "  ↑↓ / j k     Move selection",
@@ -917,6 +1270,7 @@ draw_help_pane :: proc(x, y, width, height: int) {
         "  Home / End   First / last package",
         "  Space        Toggle mark",
         "  Enter        Apply all marks",
+        "  u            Mark all updates (scan)",
         "  c            Clear all marks",
         "  f            Fetch list (rate limited)",
         "  ?            Toggle this help",
@@ -926,7 +1280,8 @@ draw_help_pane :: proc(x, y, width, height: int) {
         "prompted in Recent Operations (masked).",
         "",
         "Markers:",
-        "  [i] installed   [+] install   [-] remove",
+        "  [i] installed  [↑] update  [+] install",
+        "  [-] remove",
         "",
         "Press ? again to return to package details.",
     }
@@ -1028,11 +1383,21 @@ apply_pending :: proc(app: ^App) {
     // Installs first, then removes.
 
     for p in to_install {
+        was_installed := app.installed_set[p]
         ok, _ := perform_install([]string{p})
         if ok {
-            append_status_line(app, fmt.tprintf("installed: %s", p))
+            if was_installed {
+                append_status_line(app, fmt.tprintf("updated: %s", p))
+                delete_key(&app.update_available, p)
+            } else {
+                append_status_line(app, fmt.tprintf("installed: %s", p))
+            }
         } else {
-            append_status_line(app, fmt.tprintf("failed to install: %s", p))
+            if was_installed {
+                append_status_line(app, fmt.tprintf("failed to update: %s", p))
+            } else {
+                append_status_line(app, fmt.tprintf("failed to install: %s", p))
+            }
         }
         app.needs_redraw = true
         draw(app)  // live update in Recent Operations
@@ -1186,16 +1551,27 @@ ensure_sudo_for_apply :: proc(app: ^App) -> bool {
 }
 
 // Rebuild Recent Operations from current pending maps (sorted, clean on unmark).
+// Order: updates (installed+install mark), new installs, removes.
 sync_pending_ops_list :: proc(app: ^App) {
     clear_status_lines(app)
 
     if len(app.pending_install) > 0 {
+        updates := make([dynamic]string, 0, len(app.pending_install))
         installs := make([dynamic]string, 0, len(app.pending_install))
+        defer delete(updates)
         defer delete(installs)
         for p in app.pending_install {
-            append(&installs, p)
+            if app.installed_set[p] {
+                append(&updates, p)
+            } else {
+                append(&installs, p)
+            }
         }
+        slice.sort(updates[:])
         slice.sort(installs[:])
+        for p in updates {
+            append_status_line(app, fmt.tprintf("marked for update: %s", p))
+        }
         for p in installs {
             append_status_line(app, fmt.tprintf("marked for installation: %s", p))
         }
@@ -1385,6 +1761,9 @@ handle_key :: proc(app: ^App, key: Key) -> bool {
         case 'f', 'F':
             fetch_list(app)
 
+        case 'u', 'U':
+            mark_all_updates(app)
+
         case 'j', 'J':
             vp := term_height - 4
             move_selection(&app.left_selection, &app.left_scroll, len(app.available), +1, vp)
@@ -1485,6 +1864,9 @@ main :: proc() {
     // Initial data load (counts as a fetch for cooldown purposes)
     if refresh_data(&app) {
         app.last_fetch_unix = time.to_unix_seconds(time.now())
+        // Fill in-memory + disk cache for any missing/expired package details.
+        // Shows "loading details: n/m" in Recent Operations when many are needed.
+        preload_missing_details(&app)
     }
     // Still continue on failure — user will see error in status
     if verbose {
