@@ -196,8 +196,30 @@ run_debget :: proc(args: ..string) -> (output: string, ok: bool) {
     return output, ok
 }
 
+// Debian-style package name: starts with alnum, then alnum / + . - _
+// Rejects deb-get status lines, ANSI warnings, and paths.
+is_package_name :: proc(s: string) -> bool {
+    if len(s) == 0 || len(s) > 128 {
+        return false
+    }
+    c0 := s[0]
+    if !((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z') || (c0 >= '0' && c0 <= '9')) {
+        return false
+    }
+    for i in 0..<len(s) {
+        c := s[i]
+        switch c {
+        case 'a'..='z', 'A'..='Z', '0'..='9', '-', '+', '.', '_':
+            continue
+        case:
+            return false
+        }
+    }
+    return true
+}
+
 // Parse package name lines from deb-get list output into owned strings.
-// Frees `out` and the split lines buffer.
+// Skips warnings, ANSI, and other non-name lines. Frees `out`.
 parse_package_list_output :: proc(out: string) -> []string {
     if out == "" {
         return nil
@@ -210,16 +232,26 @@ parse_package_list_output :: proc(out: string) -> []string {
     pkgs := make([dynamic]string, 0, len(lines))
     for line in lines {
         trimmed := strings.trim_space(line)
-        if trimmed != "" {
+        if is_package_name(trimmed) {
             append(&pkgs, strings.clone(trimmed))
         }
     }
     return pkgs[:]
 }
 
-// Get full list of available packages (fast, --raw). Caller owns the slice and each name.
+// Full local catalog (manifest + 99-local + builtins). Caller owns the slice
+// and each name.
+//
+// Always --include-unsupported: that dumps APPS without validate_deb (~40ms)
+// and without intersecting /var/cache/deb-get/supported_apps.list.
+// `list --raw` without that file walks every package (~10s) and prints
+// "WARNING! Cached file ..." on stdout. With a stale file it hides names
+// that are already in the manifest but not yet in the supported index.
+//
+// This is the on-disk catalog only. New upstream packages appear after
+// `deb-get update` rewrites /etc/deb-get/*.repo; then the next startup or f.
 get_available_packages :: proc() -> ([]string, bool) {
-    out, ok := run_debget("list", "--raw")
+    out, ok := run_debget("list", "--include-unsupported", "--raw")
     if !ok {
         if out != "" do delete(out)
         return nil, false
@@ -227,9 +259,9 @@ get_available_packages :: proc() -> ([]string, bool) {
     return parse_package_list_output(out), true
 }
 
-// Get list of installed packages via deb-get. Caller owns the slice and each name.
+// Installed names from deb-get's installed file. Caller owns the slice and each name.
 get_installed_packages :: proc() -> ([]string, bool) {
-    out, ok := run_debget("list", "--installed")
+    out, ok := run_debget("list", "--include-unsupported", "--installed")
     if !ok {
         if out != "" do delete(out)
         return nil, false

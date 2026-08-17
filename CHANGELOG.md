@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-08-16
+
+### Fixed
+
+- Do not treat deb-get `WARNING! Cached file /var/cache/deb-get/...` lines as
+  packages in the left list (only Debian-style names are kept).
+- Avoid the slow `deb-get list` path when `/var/cache/deb-get/supported.list`
+  is missing: use `--include-unsupported` so startup does not `validate_deb`
+  every package (~10s × list + installed).
+- Always list with `--include-unsupported` so a stale `supported_apps.list`
+  cannot hide packages already in the local manifest. Upstream additions
+  still require `deb-get update` first; then startup or **f** reloads them.
+
+### Changed
+
+- Version **0.3.3**.
+
 ## [0.3.2] - 2026-08-05
 
 ### Fixed
@@ -82,6 +99,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Basic keyboard navigation and marking workflow (evolved through early commits).
 
 [Unreleased]: https://github.com/scottdd/debtui/compare/main...HEAD
+[0.3.3]: https://github.com/scottdd/debtui/commits/main
 [0.3.2]: https://github.com/scottdd/debtui/commits/main
 [0.3.1]: https://github.com/scottdd/debtui/commits/main
 [0.3.0]: https://github.com/scottdd/debtui/commits/main

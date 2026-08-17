@@ -84,7 +84,7 @@ Example:
 ### Other
 | Key       | Action                                   |
 |-----------|------------------------------------------|
-| `f`       | Fetch package lists from deb-get (rate limited: 30s cooldown) |
+| `f`       | Reload deb-get’s local package list (30s cooldown; does not run `deb-get update`) |
 | `?`       | Toggle full-height help on the right (hides Recent Operations until closed) |
 | `q` / `Q` | Quit (if marks are pending, prompt to apply first) |
 | `Ctrl+C`  | Quit (same as `q`)                       |
@@ -105,12 +105,14 @@ Example:
 
 `debtui` uses `deb-get` under the hood:
 
-- `deb-get list --raw` — populates the main list
-- `deb-get list --installed` — determines which packages are already installed
+- `deb-get list --include-unsupported --raw` — populates the main list from deb-get’s **local** catalog (`/etc/deb-get/*.repo` manifest, `99-local`, builtins). Does not contact the network.
+- `deb-get list --include-unsupported --installed` — which packages are already installed
 - `deb-get show <pkg list>` — fetches details for the right pane (cached locally for 7 days)
 - On **Enter**: runs `deb-get install ...` (new installs and upgrades) and/or `deb-get remove ...` for all marked packages
 
 After the package list loads (startup or **f**), `debtui` rehydrates fresh disk-cache entries into memory, then fetches at most **5** missing/expired detail entries via `deb-get show` (so startup stays responsive). Gaps load over time: when you focus a package that still needs details, it fetches that package plus up to four more gaps further down the list. If more than four packages are fetched in one burst, Recent Operations briefly shows `loading details: n/m`.
+
+**f** reloads that local catalog (30s cooldown; startup counts as a fetch). It does **not** run `deb-get update`. New packages published upstream appear in the list only after `sudo deb-get update` (or `sudo deb-get update --repos-only`) rewrites `/etc/deb-get/01-main.repo`; then restart debtui or press **f**.
 
 ### Updates
 
@@ -135,7 +137,7 @@ All package operations are performed only when you explicitly press `Enter` (or 
 - **Startup / fetch preload**: After listing packages, fresh cache files are loaded into memory; at most 5 missing/expired entries are fetched over the network. Further gaps load over time (on focus, 5 at a time) or when you run **`u`** for installed packages.
 - **Automatic cleanup**: On startup and every list fetch (`f`), the app removes:
   - Entries older than 7 days
-  - Entries for packages that no longer appear in `deb-get list --raw`
+  - Entries for packages that no longer appear in the local catalog
 - **Diagnostic logs**: If cache-related errors occur, they are written to daily files named `cache-errors-YYYY-MM-DD.log` inside the cache directory. These files are only created when something noteworthy happens.
 
 This caching makes browsing large lists of packages much faster after the first run as gaps load over time / on focus / via `u`.
